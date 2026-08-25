@@ -110,8 +110,12 @@ fn yaml_test_suite() {
         }
     }
 
-    // Conformance is 735/735 and the invariant is 100%. This assertion is what
+    // Conformance is 402/402 and the invariant is 100%. This assertion is what
     // makes that an invariant rather than a claim.
+    //
+    // It read 735 until the loader stopped walking `data/name/`, the suite's
+    // symlink index, which had been contributing every test a second time. The
+    // RATE was always right; only the denominator was inflated.
     //
     // It read `>= 10.0` until this change -- a floor two orders of magnitude below
     // the documented guarantee, under which a regression to 50% still reported
@@ -126,5 +130,47 @@ fn yaml_test_suite() {
         pass_rate >= 100.0,
         "Pass rate {pass_rate:.1}% is below the required 100% \
          ({passed}/{total} passed, {failed} failed)"
+    );
+}
+
+/// The corpus is the denominator of the conformance claim, so it is pinned.
+///
+/// The uniqueness assertion is the one that matters: the harness reported 735
+/// tests for years while carrying only 402 distinct ids, and it had every piece
+/// of information needed to contradict itself. Nothing asked it to.
+#[test]
+fn the_corpus_has_the_expected_shape() {
+    use std::collections::HashSet;
+
+    let data_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("data");
+    if !data_dir.exists() {
+        assert!(
+            std::env::var_os("GLAUCUS_ALLOW_MISSING_TEST_SUITE").is_some(),
+            "YAML test suite data not found at {}.\n\
+             Run: git submodule update --init --recursive",
+            data_dir.display()
+        );
+        return;
+    }
+
+    let tests = load_all_tests(&data_dir);
+
+    let unique: HashSet<&String> = tests.iter().map(|t| &t.id).collect();
+    assert_eq!(
+        unique.len(),
+        tests.len(),
+        "a case was loaded more than once: {} loaded, {} distinct ids",
+        tests.len(),
+        unique.len()
+    );
+
+    // 333 single-document cases plus 69 sub-cases under 17 parent directories,
+    // from the `data-2022-01-17` release. Changing the pinned release changes
+    // this number, and that should be a deliberate commit rather than a drift.
+    assert_eq!(
+        tests.len(),
+        402,
+        "corpus size changed; if the submodule was repinned, update this and \
+         every published conformance figure with it"
     );
 }

@@ -5,4 +5,10 @@
 [submodule "crates/glaucus-yaml-test-suite/data"]
 	path = crates/glaucus-yaml-test-suite/data
 	url = https://github.com/yaml/yaml-test-suite.git
-	branch = data
+	# Pinned to a dated RELEASE tag, not the `data` branch. Upstream's ReadMe is
+	# explicit: "You shouldn't use the data branch directly as the branch
+	# contains unreleased commits which might be wrong, and it is squashed and
+	# force pushed from time to time." Tracking that branch made the conformance
+	# corpus -- the thing the 100% floor defends -- a force-pushable moving
+	# target. `data-2022-01-17` is the newest release as of this pin.
+	branch = data-2022-01-17

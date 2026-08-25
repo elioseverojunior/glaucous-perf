@@ -27,7 +27,7 @@ SPDX-License-Identifier: MIT OR Apache-2.0
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/elioseverojunior/glaucus/badge)](https://securityscorecards.dev/viewer/?uri=github.com/elioseverojunior/glaucus)
 [![SLSA 3](https://slsa.dev/images/gh-badge-level3.svg)](https://slsa.dev)
 
-Glaucus is a from-scratch YAML 1.2.2 library built for safety, correctness, and speed. It passes **100% of the official YAML test suite** (735/735 tests) and provides both a serde integration and a low-level node API.
+Glaucus is a from-scratch YAML 1.2.2 library built for safety, correctness, and speed. It passes **100% of the official YAML test suite** (402/402 cases) and provides both a serde integration and a low-level node API.
 
 ## Quick Start
 
@@ -164,7 +164,7 @@ Installing both is redundant — they produce the same `glaucus` binary. Run
 
 ### Spec Complete
 
-- **735/735** [Official YAML Test Suite](https://github.com/yaml/yaml-test-suite) cases pass (v2022-01-17)
+- **402/402** [Official YAML Test Suite](https://github.com/yaml/yaml-test-suite) cases pass (`data-2022-01-17`)
 - Full YAML 1.2.2 support: anchors, aliases, tags, block scalars, flow collections, multi-document streams
 - Correct handling of edge cases that trip up other parsers
 

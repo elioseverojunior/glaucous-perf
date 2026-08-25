@@ -15,7 +15,7 @@ external dependencies** — it depends only on `glaucus-core`. No `serde`, no
 
 It validates Glaucus against **every case in the official
 [YAML test suite](https://github.com/yaml/yaml-test-suite)** — the same suite
-used to certify YAML implementations. Glaucus passes **735 / 735 (100%)** against
+used to certify YAML implementations. Glaucus passes **402 / 402 (100%)** against
 the pinned snapshot (`v2022-01-17`).
 
 ## Setup
@@ -47,7 +47,7 @@ The integration test (`tests/yaml_test_suite.rs`) loads every case, runs it
 through Glaucus, prints a results table (total / passed / failed / skipped / rate)
 plus a failure breakdown, and asserts a **100% pass rate**.
 
-The floor is 100 rather than a progress marker: conformance is 735/735, so any
+The floor is 100 rather than a progress marker: conformance is 402/402, so any
 lower threshold would let a regression report green. A missing `data/` submodule
 likewise **fails** rather than skipping — a gate that can opt out of running is
 not a gate. Set `GLAUCUS_ALLOW_MISSING_TEST_SUITE=1` to skip deliberately when
@@ -92,7 +92,8 @@ the official suite specifies.
 ### Conformance Test
 
 The conformance harness (`tests/yaml_test_suite.rs`) validates Glaucus against all
-735 official YAML test cases:
+402 official YAML test cases — 333 single-document cases plus 69 sub-cases under
+17 parent directories:
 
 ```bash
 cargo test -p glaucus-yaml-test-suite --test yaml_test_suite
@@ -149,7 +150,7 @@ round-trip fidelity: <faithful> faithful, <rejected> rejected,
 cargo test -p glaucus-yaml-test-suite
 ```
 
-Runs both conformance (735 cases, ~30s) and fidelity (~3000 files, ~1.5s) in
+Runs both conformance (402 cases, ~30s) and fidelity (~3000 files, ~1.5s) in
 sequence.
 
 ## Architecture
@@ -177,6 +178,12 @@ flowchart LR
 
 The cases come from the **official [`yaml/yaml-test-suite`](https://github.com/yaml/yaml-test-suite)**,
 the canonical conformance suite for YAML implementations. It is vendored as a git
-submodule pinned to tag **`v2022-01-17`** so the 735-case result is fully
-reproducible and immune to upstream drift. Bumping the suite is a deliberate,
-reviewable change to the submodule pointer.
+submodule pinned to the release tag **`data-2022-01-17`** so the 402-case result
+is reproducible. Bumping the suite is a deliberate, reviewable change to the
+submodule pointer.
+
+The tag matters. This previously tracked `branch = data`, which upstream's own
+ReadMe warns against: that branch "contains unreleased commits which might be
+wrong, and it is squashed and force pushed from time to time". Tracking it made
+the corpus a force-pushable moving target — the opposite of the immunity to
+upstream drift this paragraph used to claim.

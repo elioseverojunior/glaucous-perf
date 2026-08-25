@@ -94,8 +94,27 @@ pub fn load_all_tests(data_dir: &Path) -> Vec<DataTestCase> {
         .filter(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            // 4-char alphanumeric test IDs only (skips `name/`, `tags/`)
-            name.len() == 4 && name.chars().all(|c| c.is_ascii_alphanumeric())
+            // Test IDs are four alphanumeric characters. So are the names of the
+            // two INDEX directories the suite ships beside the tests, which is why
+            // they have to be excluded explicitly rather than by shape:
+            //
+            //   data/name/  350 symlinks by human-readable name -> ../V55R etc.
+            //   data/tags/   33 symlinks by tag
+            //
+            // `name/` has no `in.yaml` of its own, so an ID-shaped filter admits
+            // it, the loader treats it as a multi-subtest parent, and every test
+            // is loaded a SECOND time under a different id. That is how the
+            // reported total reached 735 against a corpus of 402 -- a third of
+            // the suite counted twice, for years, in the number the project
+            // advertises most.
+            //
+            // An earlier version of this comment claimed the filter already
+            // skipped both. It never did; only `tags/` fell out by accident,
+            // because its symlinks point at directories with no direct `in.yaml`.
+            name.len() == 4
+                && name.chars().all(|c| c.is_ascii_alphanumeric())
+                && name != "name"
+                && name != "tags"
         })
         .collect();
     entries.sort_by_key(std::fs::DirEntry::file_name);
@@ -468,8 +487,8 @@ mod tests {
     #[test]
     fn run_test_unexpected_parse_error_is_fail() {
         // Tab characters in a block mapping are forbidden by YAML spec (§6.1).
-        // Glaucus correctly rejects this as an error (confirmed by 735/735 test
-        // suite pass rate). With expect_error=false the run_test path at
+        // Glaucus correctly rejects this as an error (confirmed by the 402/402
+        // test suite pass rate). With expect_error=false the run_test path at
         // line 280 is exercised: Err(e) => Fail("unexpected error: …").
         let tc = DataTestCase {
             id: "T003".to_string(),

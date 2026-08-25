@@ -26,7 +26,7 @@ repository to the mechanism that implements it and where it runs.
 | **Project scorecard** | OpenSSF Scorecard (`ossf/scorecard-action`); weekly schedule | CI only | `scorecards.yml` |
 | **Fuzzing** | 9 `cargo-fuzz` targets — `fuzz_scanner`, `fuzz_parser`, `fuzz_round_trip`, `fuzz_limits`, `fuzz_alias_graph`, `fuzz_serde`, `fuzz_cst_roundtrip`, `fuzz_lossless_edit`, `fuzz_merge_keys` | `mise run fuzz:all` | `nightly.yml` — `fuzz` job |
 | **Test coverage** | `cargo-tarpaulin`, LLVM engine, **code and doctests both at 100%** (see below) | `mise run coverage` | `cicd.yml` — `tests` job |
-| **Spec conformance** | Official YAML test suite, 735/735, enforced at a 100% floor | `mise run test` | `cicd.yml` — `tests` job |
+| **Spec conformance** | Official YAML test suite, 402/402, enforced at a 100% floor | `mise run test` | `cicd.yml` — `tests` job |
 
 ### Coverage: one invocation, code and doctests alike
 

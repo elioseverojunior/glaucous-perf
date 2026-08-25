@@ -386,7 +386,7 @@ if [ "${usage_verbose:-false}" = "true" ]; then set -x; fi
 # `submodule.recurse` does not cover worktree creation. A bare `git worktree
 # add` therefore produces an EMPTY crates/glaucus-yaml-test-suite/data, and the
 # conformance harnesses open with `if !data_dir.exists() { return; }` -- so the
-# 735-case gate either passes having asserted nothing or dies on "0 faithful
+# 402-case gate either passes having asserted nothing or dies on "0 faithful
 # cases". Controlling the creation path is the only way to prevent that;
 # `setup:submodules` self-heals a worktree made any other way, and
 # `test:conformance` refuses to run without the corpus.
@@ -436,7 +436,7 @@ if [ "${usage_verbose:-false}" = "true" ]; then set -x; fi
 # `submodule.recurse` does not cover worktree creation. A fresh worktree
 # therefore gets an EMPTY crates/glaucus-yaml-test-suite/data, and both
 # conformance harnesses open with `if !data_dir.exists() { return; }` -- so the
-# 735-case gate passes having asserted nothing, or dies on "0 faithful cases".
+# 402-case gate passes having asserted nothing, or dies on "0 faithful cases".
 #
 # `git submodule status` prefixes an UNINITIALISED entry with `-`, which is the
 # only reliable signal: the directory exists either way, so a path test cannot
@@ -453,7 +453,7 @@ fi
 # it dirties the working tree and changes which corpus the conformance gate runs
 # against. Doing that silently on every directory change -- `[hooks] enter`
 # calls `setup`, which depends on this task -- would rewrite a pinned test
-# fixture behind your back and make the 735-case result irreproducible.
+# fixture behind your back and make the 402-case result irreproducible.
 if [ "${usage_latest:-false}" != "true" ]; then
     echo "submodules: already initialised (pass --latest to advance the pin)"
     exit 0
@@ -1748,7 +1748,7 @@ if [ "${usage_verbose:-false}" = "true" ]; then set -x; fi
 # `git worktree add` and a non-recursive `git clone` both leave the directory
 # present but EMPTY, which the in-test check does not catch either: there the
 # fidelity property fails with "only 0 faithful cases" and cargo aborts before
-# the conformance binary ever runs, so the 735-case result is silently skipped.
+# the conformance binary ever runs, so the 402-case result is silently skipped.
 # Checking for CONTENT rather than existence covers both.
 data="crates/glaucus-yaml-test-suite/data"
 if [ ! -d "${data}" ] || [ -z "$(ls -A "${data}" 2>/dev/null)" ]; then
@@ -1759,7 +1759,7 @@ if [ ! -d "${data}" ] || [ -z "$(ls -A "${data}" 2>/dev/null)" ]; then
 fi
 
 # `--nocapture` because the pass/fail counts are the point: the harness prints a
-# 735-case report to stderr that cargo would otherwise swallow on success.
+# 402-case report to stderr that cargo would otherwise swallow on success.
 cargo test -p glaucus-yaml-test-suite \
     --test yaml_test_suite --test round_trip_fidelity -- --nocapture
 '''
@@ -1848,7 +1848,7 @@ set -Eeuo pipefail
 eval "args=(${usage_args:-})"
 
 # NO `depends` on test:conformance, deliberately. `depends` would run it before
-# this body, which then runs it again -- the whole 735-case suite twice. Calling
+# this body, which then runs it again -- the whole 402-case suite twice. Calling
 # both here also fixes the order: coverage first, conformance second, and a
 # failure in either stops the run.
 if [ -z "${usage_args:-}" ]; then
