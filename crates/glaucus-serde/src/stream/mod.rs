@@ -7,4 +7,5 @@
 //! Built alongside the tree path rather than replacing it, and kept honest by
 //! `tests/differential.rs`, which compares the two across a corpus.
 
+pub(crate) mod scalar;
 pub(crate) mod tape;
