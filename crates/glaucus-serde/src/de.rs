@@ -9,7 +9,8 @@
 
 use crate::error::Error;
 use glaucus_ast::node::Node;
-use glaucus_core::types::{ScalarStyle, Tag};
+use glaucus_core::schema;
+use glaucus_core::types::{ScalarStyle, Tag, YamlVersion};
 use serde::de::{self, DeserializeOwned, DeserializeSeed, IntoDeserializer, Visitor};
 
 /// Deserializes a `Node` tree into a Rust type.
@@ -39,62 +40,6 @@ impl<'a> Deserializer<'a> {
     pub const fn from_node_with(node: &'a Node<'a>, yaml_1_1: bool) -> Self {
         Self { node, yaml_1_1 }
     }
-}
-
-fn parse_integer(value: &str) -> Option<i64> {
-    let (negative, digits) = value.strip_prefix('-').map_or_else(
-        || {
-            value
-                .strip_prefix('+')
-                .map_or((false, value), |rest| (false, rest))
-        },
-        |rest| (true, rest),
-    );
-
-    if digits.is_empty() {
-        return None;
-    }
-
-    let abs = if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        i64::from_str_radix(hex, 16).ok()?
-    } else if let Some(oct) = digits
-        .strip_prefix("0o")
-        .or_else(|| digits.strip_prefix("0O"))
-    {
-        i64::from_str_radix(oct, 8).ok()?
-    } else {
-        digits.parse::<i64>().ok()?
-    };
-
-    if negative { Some(-abs) } else { Some(abs) }
-}
-
-fn parse_unsigned(value: &str) -> Option<u64> {
-    if value.starts_with('-') {
-        return None;
-    }
-    let digits = value.strip_prefix('+').unwrap_or(value);
-
-    if digits.is_empty() {
-        return None;
-    }
-
-    if let Some(hex) = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-    {
-        return u64::from_str_radix(hex, 16).ok();
-    }
-    digits
-        .strip_prefix("0o")
-        .or_else(|| digits.strip_prefix("0O"))
-        .map_or_else(
-            || digits.parse::<u64>().ok(),
-            |oct| u64::from_str_radix(oct, 8).ok(),
-        )
 }
 
 /// A YAML core-schema tag, resolved to the type it asserts.
@@ -127,33 +72,6 @@ impl CoreTag {
             "binary" => Some(Self::Binary),
             _ => None,
         }
-    }
-}
-
-fn parse_float(value: &str) -> Option<f64> {
-    let lower = value.to_ascii_lowercase();
-    match lower.as_str() {
-        ".inf" | "+.inf" => Some(f64::INFINITY),
-        "-.inf" => Some(f64::NEG_INFINITY),
-        ".nan" => Some(f64::NAN),
-
-        // The digit guard exists because Rust's `f64::from_str` also accepts
-        // `inf`, `infinity` and `nan`, which YAML 1.2 §10.2 does NOT recognise:
-        // the float production admits exactly `[-+]?\.(inf|Inf|INF)` and
-        // `\.(nan|NaN|NAN)`, matched above, and the leading dot is mandatory.
-        // Bare `inf` / `nan` / `infinity` are plain strings.
-        //
-        // Requiring at least one ASCII digit is a complete separator rather than a
-        // heuristic: every other form in the YAML float grammar
-        // (`[-+]?( \.[0-9]+ | [0-9]+(\.[0-9]*)? )([eE][-+]?[0-9]+)?`) contains a
-        // digit by construction, while the three bare words contain none.
-        //
-        // This is the Norway problem's shape -- implicit resolution firing on a
-        // word that should stay text -- and worse in consequence. A float infinity
-        // has no JSON representation, so an `inf` that resolved as a float becomes
-        // `null` on the way out. The value does not change type; it vanishes.
-        _ if value.bytes().any(|b| b.is_ascii_digit()) => value.parse::<f64>().ok(),
-        _ => None,
     }
 }
 
@@ -192,20 +110,20 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
                 }
 
                 // Null
-                if Deserializer::is_null(value) {
+                if schema::is_null(value) {
                     return visitor.visit_unit();
                 }
 
                 // Bool
-                if self.is_bool_true(value) {
+                if schema::resolve_bool(value, self.version()) == Some(true) {
                     return visitor.visit_bool(true);
                 }
-                if self.is_bool_false(value) {
+                if schema::resolve_bool(value, self.version()) == Some(false) {
                     return visitor.visit_bool(false);
                 }
 
                 // Integer (try unsigned first for large positive values)
-                if let Some(u) = parse_unsigned(value) {
+                if let Some(u) = schema::resolve_uint(value) {
                     // Prefer the signed visitor when the value fits, so small
                     // positive integers deserialize into `i64` targets.
                     if let Ok(i) = i64::try_from(u) {
@@ -213,12 +131,12 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
                     }
                     return visitor.visit_u64(u);
                 }
-                if let Some(i) = parse_integer(value) {
+                if let Some(i) = schema::resolve_int(value) {
                     return visitor.visit_i64(i);
                 }
 
                 // Float
-                if let Some(f) = parse_float(value) {
+                if let Some(f) = schema::resolve_float(value) {
                     return visitor.visit_f64(f);
                 }
 
@@ -234,9 +152,9 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         let value = self.scalar_value()?;
-        if self.is_bool_true(value) {
+        if schema::resolve_bool(value, self.version()) == Some(true) {
             visitor.visit_bool(true)
-        } else if self.is_bool_false(value) {
+        } else if schema::resolve_bool(value, self.version()) == Some(false) {
             visitor.visit_bool(false)
         } else {
             Err(err(format!("expected boolean, found `{value}`")))
@@ -341,7 +259,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         if let Node::Scalar(s) = self.node
             && s.style == ScalarStyle::Plain
-            && Deserializer::is_null(&s.value)
+            && schema::is_null(&s.value)
         {
             return visitor.visit_none();
         }
@@ -351,7 +269,7 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         if let Node::Scalar(s) = self.node
             && s.style == ScalarStyle::Plain
-            && Deserializer::is_null(&s.value)
+            && schema::is_null(&s.value)
         {
             return visitor.visit_unit();
         }
@@ -455,26 +373,17 @@ impl<'de> de::Deserializer<'de> for &mut Deserializer<'_> {
 impl Deserializer<'_> {
     // ── Scalar type resolution (YAML 1.2 Core Schema §10.3.2) ──────
 
-    fn is_null(value: &str) -> bool {
-        matches!(value, "null" | "Null" | "NULL" | "~" | "")
-    }
-
-    fn is_bool_true(&self, value: &str) -> bool {
-        matches!(value, "true" | "True" | "TRUE")
-            || (self.yaml_1_1
-                && matches!(
-                    value,
-                    "y" | "Y" | "yes" | "Yes" | "YES" | "on" | "On" | "ON"
-                ))
-    }
-
-    fn is_bool_false(&self, value: &str) -> bool {
-        matches!(value, "false" | "False" | "FALSE")
-            || (self.yaml_1_1
-                && matches!(
-                    value,
-                    "n" | "N" | "no" | "No" | "NO" | "off" | "Off" | "OFF"
-                ))
+    /// The YAML version this deserialiser resolves scalars under.
+    ///
+    /// `yaml_1_1` is threaded from `ParserConfig` and from a `%YAML 1.1`
+    /// directive; the resolvers take the version itself, because that is what the
+    /// specification is parameterised by.
+    const fn version(&self) -> YamlVersion {
+        if self.yaml_1_1 {
+            YamlVersion::V1_1
+        } else {
+            YamlVersion::V1_2
+        }
     }
 
     fn scalar_value(&self) -> Result<&str, Error> {
@@ -515,19 +424,19 @@ impl Deserializer<'_> {
             CoreTag::Int => {
                 // Early returns rather than `map_or_else`: both arms would need to
                 // capture `visitor`, and it can only be moved into one closure.
-                if let Some(u) = parse_unsigned(value) {
+                if let Some(u) = schema::resolve_uint(value) {
                     if let Ok(i) = i64::try_from(u) {
                         return visitor.visit_i64(i);
                     }
                     return visitor.visit_u64(u);
                 }
-                parse_integer(value).map_or_else(
+                schema::resolve_int(value).map_or_else(
                     || Err(err(format!("`!!int` scalar is not an integer: `{value}`"))),
                     |i| visitor.visit_i64(i),
                 )
             }
 
-            CoreTag::Float => parse_float(value).map_or_else(
+            CoreTag::Float => schema::resolve_float(value).map_or_else(
                 || Err(err(format!("`!!float` scalar is not a float: `{value}`"))),
                 |f| visitor.visit_f64(f),
             ),
@@ -537,17 +446,17 @@ impl Deserializer<'_> {
             // otherwise. A second, divergent notion of "boolean" here would be a
             // bug farm.
             CoreTag::Bool => {
-                if self.is_bool_true(value) {
+                if schema::resolve_bool(value, self.version()) == Some(true) {
                     return visitor.visit_bool(true);
                 }
-                if self.is_bool_false(value) {
+                if schema::resolve_bool(value, self.version()) == Some(false) {
                     return visitor.visit_bool(false);
                 }
                 Err(err(format!("`!!bool` scalar is not a boolean: `{value}`")))
             }
 
             CoreTag::Null => {
-                if Self::is_null(value) {
+                if schema::is_null(value) {
                     return visitor.visit_unit();
                 }
                 Err(err(format!("`!!null` scalar is not null: `{value}`")))
@@ -562,18 +471,18 @@ impl Deserializer<'_> {
 
     fn parse_int(&self) -> Result<i64, Error> {
         let value = self.scalar_value()?;
-        parse_integer(value).ok_or_else(|| err(format!("expected integer, found `{value}`")))
+        schema::resolve_int(value).ok_or_else(|| err(format!("expected integer, found `{value}`")))
     }
 
     fn parse_uint(&self) -> Result<u64, Error> {
         let value = self.scalar_value()?;
-        parse_unsigned(value)
+        schema::resolve_uint(value)
             .ok_or_else(|| err(format!("expected unsigned integer, found `{value}`")))
     }
 
     fn parse_float_val(&self) -> Result<f64, Error> {
         let value = self.scalar_value()?;
-        parse_float(value).ok_or_else(|| err(format!("expected float, found `{value}`")))
+        schema::resolve_float(value).ok_or_else(|| err(format!("expected float, found `{value}`")))
     }
 }
 
@@ -980,6 +889,47 @@ mod tests {
     fn de_string() {
         let result: String = from_str("hello").unwrap();
         assert_eq!(result, "hello");
+    }
+
+    // ─── Resolution reference pin (#39) ─────────────────────────────
+
+    /// Pins the deserialiser's scalar resolution as the REFERENCE behaviour.
+    ///
+    /// Written before routing resolution through `glaucus_core::schema` and
+    /// confirmed passing against the private copies it replaced. TDD is inverted
+    /// deliberately here: this is not describing new behaviour, it is fixing the
+    /// existing behaviour in place so the substitution cannot alter it silently.
+    ///
+    /// If this ever fails, the resolvers diverged from the reference — which is
+    /// the exact defect #38 exists to remove.
+    #[test]
+    fn scalar_resolution_reference_pin() {
+        // Radix prefixes, both cases, both signs.
+        assert_eq!(from_str::<i64>("0x1F").ok(), Some(31));
+        assert_eq!(from_str::<i64>("0o17").ok(), Some(15));
+        assert_eq!(from_str::<i64>("-0x10").ok(), Some(-16));
+        assert_eq!(from_str::<u64>("0x1F").ok(), Some(31));
+
+        // Unsigned refuses a leading minus outright, so `-0` cannot become zero.
+        assert!(from_str::<u64>("-1").is_err());
+
+        // Booleans are case-sensitive against the enumerated spellings.
+        assert_eq!(from_str::<bool>("TRUE").ok(), Some(true));
+        assert!(from_str::<bool>("tRuE").is_err());
+
+        // Null.
+        assert_eq!(from_str::<Option<u8>>("~").ok(), Some(None));
+
+        // #29 — the directive is what widens the boolean vocabulary, not a flag.
+        assert_eq!(from_str::<bool>("%YAML 1.1\n---\nyes").ok(), Some(true));
+        assert!(from_str::<bool>("yes").is_err());
+
+        // #26 — bare words stay strings; only the dotted forms are floats.
+        assert!(from_str::<f64>("inf").is_err());
+        assert!(from_str::<f64>("nan").is_err());
+        assert!(from_str::<f64>(".inf").is_ok());
+        assert!(from_str::<f64>(".nan").is_ok());
+        assert_eq!(from_str::<String>("inf").ok().as_deref(), Some("inf"));
     }
 
     // ─── Core-schema tag resolution ─────────────────────────────────
