@@ -11,6 +11,7 @@
 pub mod composer;
 pub mod emitter;
 pub mod node;
+mod path;
 
 pub use composer::{Composer, compose_all};
 pub use emitter::{EmitterConfig, emit, emit_to_string};
