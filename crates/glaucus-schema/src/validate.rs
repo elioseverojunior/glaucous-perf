@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::schema::{JsonType, Schema};
+use crate::schema::{JsonType, Schema, classify_scalar};
 use glaucus_ast::node::Node;
 use glaucus_core::types::{ScalarStyle, Span};
 
@@ -31,23 +31,6 @@ pub fn validate(data: &Node<'_>, schema: &Schema) -> Result<(), Vec<SchemaError>
         Ok(())
     } else {
         Err(errors)
-    }
-}
-
-/// Classifies a plain scalar string into a [`JsonType`].
-fn classify_scalar(value: &str) -> JsonType {
-    match value {
-        "null" | "Null" | "NULL" | "~" | "" => JsonType::Null,
-        "true" | "True" | "TRUE" | "false" | "False" | "FALSE" => JsonType::Boolean,
-        _ => {
-            if value.parse::<i64>().is_ok() {
-                JsonType::Integer
-            } else if value.parse::<f64>().is_ok() {
-                JsonType::Number
-            } else {
-                JsonType::String
-            }
-        }
     }
 }
 
@@ -494,5 +477,87 @@ mod tests {
 
         let string_sc = schema("type: object\nproperties:\n  n: {type: string}\n");
         assert!(validate(&node("n: |-\n  123\n"), &string_sc).is_ok());
+    }
+}
+#[cfg(test)]
+mod resolution_parity_tests {
+    use super::validate;
+    use crate::Schema;
+    use glaucus_ast::node::Node;
+
+    fn node(s: &str) -> Node<'static> {
+        glaucus_ast::composer::Composer::new(s)
+            .next()
+            .unwrap()
+            .unwrap()
+            .into_owned()
+    }
+
+    fn accepts(scalar: &str, ty: &str) -> bool {
+        let sc = Schema::from_node(&node(&format!(
+            "type: object\nproperties:\n  v: {{type: {ty}}}\n"
+        )));
+        validate(&node(&format!("v: {scalar}\n")), &sc).is_ok()
+    }
+
+    /// #40: `glaucus schema validate` rejected documents `glaucus from_str` reads.
+    /// `classify_scalar` used a bare `parse::<i64>()`, which does not know the
+    /// `0x`/`0o` radix prefixes the Core Schema defines.
+    #[test]
+    fn radix_prefixed_integers_classify_as_integer() {
+        for scalar in ["0x1F", "0X1f", "0o17", "0O17", "-0x10", "+0x10"] {
+            assert!(
+                accepts(scalar, "integer"),
+                "{scalar} must satisfy `type: integer` -- the deserialiser reads it as one"
+            );
+        }
+    }
+
+    /// A bare leading zero is decimal in YAML 1.2, so `017` is an integer too --
+    /// but seventeen, not fifteen. Classification only has to agree that it is an
+    /// integer; the value is the deserialiser's business.
+    #[test]
+    fn bare_leading_zero_still_classifies_as_integer() {
+        assert!(accepts("017", "integer"));
+    }
+
+    /// #26 never reached this file. `classify_scalar` used `parse::<f64>()`, which
+    /// accepts the bare words, so validation and deserialisation were exactly
+    /// INVERTED on inf/nan: validate called `inf` a number and `.inf` a string,
+    /// while the deserialiser said the opposite.
+    #[test]
+    fn bare_inf_and_nan_classify_as_string_not_number() {
+        for scalar in ["inf", "Infinity", "nan", "NaN"] {
+            assert!(
+                accepts(scalar, "string"),
+                "{scalar} is a string under YAML 1.2"
+            );
+            assert!(
+                !accepts(scalar, "number"),
+                "{scalar} must not satisfy `type: number`"
+            );
+        }
+    }
+
+    #[test]
+    fn dotted_inf_and_nan_classify_as_number() {
+        for scalar in [".inf", "-.inf", ".nan", ".NaN"] {
+            assert!(accepts(scalar, "number"), "{scalar} is a float");
+        }
+    }
+
+    /// Booleans stay case-sensitive: the spec enumerates three spellings each.
+    #[test]
+    fn boolean_classification_is_case_sensitive() {
+        for scalar in ["true", "True", "TRUE", "false", "False", "FALSE"] {
+            assert!(accepts(scalar, "boolean"), "{scalar} is a boolean");
+        }
+        for scalar in ["tRuE", "fAlSe", "yes", "no"] {
+            assert!(
+                !accepts(scalar, "boolean"),
+                "{scalar} is not an enumerated spelling"
+            );
+            assert!(accepts(scalar, "string"), "{scalar} is a string");
+        }
     }
 }

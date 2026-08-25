@@ -25,6 +25,39 @@ pub enum JsonType {
     Object,
 }
 
+/// Classifies a plain scalar into the JSON type it resolves to.
+///
+/// Routed through [`glaucus_core::schema`] so validation, coercion and the
+/// deserialiser cannot disagree. They did: this function used a bare
+/// `parse::<i64>()`, which does not know the Core Schema's `0x`/`0o` radix
+/// prefixes, so `glaucus schema validate` rejected `0x1F` as a string while
+/// `glaucus from_str` read it as 31. It also used `parse::<f64>()`, which accepts
+/// the bare words `inf` and `nan` that YAML 1.2 does not — inverting inf/nan
+/// against the deserialiser in both directions.
+///
+/// Order matters: an integer also parses as a float, so `resolve_int` is asked
+/// first.
+///
+/// Resolution is done under [`YamlVersion::V1_2`]. A schema validates a `Node`,
+/// which carries no document version, so a `%YAML 1.1` directive cannot reach
+/// here; the 1.2 vocabulary is the conservative answer.
+pub(crate) fn classify_scalar(value: &str) -> JsonType {
+    use glaucus_core::schema as core;
+    use glaucus_core::types::YamlVersion;
+
+    if core::is_null(value) {
+        JsonType::Null
+    } else if core::resolve_bool(value, YamlVersion::V1_2).is_some() {
+        JsonType::Boolean
+    } else if core::resolve_int(value).is_some() {
+        JsonType::Integer
+    } else if core::resolve_float(value).is_some() {
+        JsonType::Number
+    } else {
+        JsonType::String
+    }
+}
+
 /// A parsed JSON-Schema (draft 2020-12 subset). Unknown keywords are ignored.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {

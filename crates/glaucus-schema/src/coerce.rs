@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use crate::schema::{JsonType, Schema};
+use crate::schema::{JsonType, Schema, classify_scalar};
 use glaucus_cst::Document;
 
 /// A single value coercion that was applied.
@@ -87,29 +87,31 @@ fn coerce_value_multi(text: &str, types: &[JsonType]) -> Option<String> {
 
 /// Canonical text for `text` under `ty`, or `None` if not coercible / already canonical.
 fn coerce_value(text: &str, ty: JsonType) -> Option<String> {
+    use glaucus_core::schema as core;
+    use glaucus_core::types::YamlVersion;
+
     let inner = strip_quotes(text);
+
+    // Nothing to repair if the text ALREADY satisfies the target type.
+    //
+    // This is what stops `True` coercing to `true`: it is a valid boolean
+    // spelling, so rewriting it is a style edit, not a fix. The previous version
+    // lowercased before matching and so also accepted `tRuE` -- which the parser
+    // reads as a string. A coercion that produces a document the parser then
+    // reads differently is worse than no coercion at all (#40).
+    if classify_scalar(text) == ty {
+        return None;
+    }
+
     match ty {
-        JsonType::Integer => inner.parse::<i64>().ok().map(|i| i.to_string()),
-        JsonType::Number => inner.parse::<f64>().ok().map(|_| inner.to_string()),
-        JsonType::Boolean => match inner.to_ascii_lowercase().as_str() {
-            "true" => Some("true".to_string()),
-            "false" => Some("false".to_string()),
-            _ => None,
-        },
-        JsonType::String => {
-            if text.starts_with('"') || text.starts_with('\'') {
-                None
-            } else if inner.parse::<f64>().is_ok()
-                || matches!(
-                    inner.to_ascii_lowercase().as_str(),
-                    "true" | "false" | "null"
-                )
-            {
-                Some(format!("\"{inner}\""))
-            } else {
-                None
-            }
-        }
+        JsonType::Integer => core::resolve_int(inner).map(|i| i.to_string()),
+        JsonType::Number => core::resolve_float(inner).map(|_| inner.to_string()),
+        JsonType::Boolean => core::resolve_bool(inner, YamlVersion::V1_2).map(|b| b.to_string()),
+        // Reaching here means the text does NOT classify as a string -- it is a
+        // null, boolean or number that the schema wants kept as text -- so
+        // quoting is exactly the repair. An already-quoted scalar was caught by
+        // the guard above.
+        JsonType::String => Some(format!("\"{inner}\"")),
         _ => None,
     }
 }
@@ -195,12 +197,38 @@ mod tests {
         assert_eq!(changes[0].path, "port");
     }
 
+    /// CHANGED by #40. This asserted `True` -> `true`.
+    ///
+    /// `True` is one of the three boolean spellings the specification enumerates,
+    /// so it already satisfies `type: boolean`. Rewriting it was a style edit
+    /// dressed as a repair, and it came from the same `to_ascii_lowercase()` that
+    /// also accepted `tRuE` -- which the parser reads as a *string*. Coercion that
+    /// disagrees with the parser is worse than no coercion, so the normalisation
+    /// went with the bug.
+    ///
+    /// The genuine repair is unquoting, covered below and in
+    /// `resolution_parity_tests::quoted_booleans_still_unquote`.
     #[test]
-    fn coerces_boolean_case() {
+    fn valid_boolean_spellings_are_left_alone() {
         let sc = schema("type: object\nproperties:\n  flag: {type: boolean}\n");
-        let mut doc = Document::parse("flag: True\n");
-        let _ = coerce_to_schema(&mut doc, &sc);
-        assert_eq!(doc.to_string(), "flag: true\n");
+        for spelling in ["True", "TRUE", "true", "False", "FALSE", "false"] {
+            let mut doc = Document::parse(&format!("flag: {spelling}\n"));
+            let changes = coerce_to_schema(&mut doc, &sc);
+            assert!(
+                changes.is_empty(),
+                "{spelling} is already a boolean; nothing to coerce"
+            );
+            assert_eq!(doc.to_string(), format!("flag: {spelling}\n"));
+        }
+    }
+
+    #[test]
+    fn quoted_boolean_is_unquoted() {
+        let sc = schema("type: object\nproperties:\n  flag: {type: boolean}\n");
+        let mut doc = Document::parse("flag: \"true\"  # keep\n");
+        let changes = coerce_to_schema(&mut doc, &sc);
+        assert_eq!(doc.to_string(), "flag: true  # keep\n");
+        assert_eq!(changes.len(), 1);
     }
 
     #[test]
@@ -422,5 +450,55 @@ mod tests {
         let mut doc = Document::parse("v: anything\n");
         assert!(coerce_to_schema(&mut doc, &sc).is_empty());
         assert_eq!(doc.to_string(), "v: anything\n");
+    }
+}
+#[cfg(test)]
+mod resolution_parity_tests {
+    use super::coerce_value;
+    use crate::schema::JsonType;
+
+    /// #40: `coerce_value` lowercased before matching, so it accepted `tRuE` --
+    /// a spelling the deserialiser rejects. A coercion that produces a document
+    /// the parser then reads differently is worse than no coercion at all.
+    ///
+    /// Both now return `None`, for different reasons: `TRUE` is already a valid
+    /// boolean and needs no repair, while `tRuE` is not a boolean in any version
+    /// and no repair can make it one.
+    #[test]
+    fn boolean_coercion_is_case_sensitive() {
+        assert_eq!(coerce_value("TRUE", JsonType::Boolean), None);
+        assert_eq!(coerce_value("tRuE", JsonType::Boolean), None);
+        assert_eq!(coerce_value("True", JsonType::Boolean), None);
+        assert_eq!(coerce_value("fAlSe", JsonType::Boolean), None);
+    }
+
+    /// The genuine coercion is unquoting: the document says `"true"` where the
+    /// schema wants a boolean. That must keep working.
+    #[test]
+    fn quoted_booleans_still_unquote() {
+        assert_eq!(
+            coerce_value("\"true\"", JsonType::Boolean),
+            Some("true".to_string())
+        );
+        assert_eq!(
+            coerce_value("'false'", JsonType::Boolean),
+            Some("false".to_string())
+        );
+    }
+
+    /// A radix-prefixed integer already satisfies `type: integer` once
+    /// classification is shared, so there is nothing to coerce.
+    #[test]
+    fn radix_prefixed_integers_need_no_coercion() {
+        assert_eq!(coerce_value("0x1F", JsonType::Integer), None);
+        assert_eq!(coerce_value("0o17", JsonType::Integer), None);
+    }
+
+    #[test]
+    fn quoted_integers_still_unquote() {
+        assert_eq!(
+            coerce_value("\"8080\"", JsonType::Integer),
+            Some("8080".to_string())
+        );
     }
 }
