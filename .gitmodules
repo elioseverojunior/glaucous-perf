@@ -5,10 +5,49 @@
 [submodule "crates/glaucus-yaml-test-suite/data"]
 	path = crates/glaucus-yaml-test-suite/data
 	url = https://github.com/yaml/yaml-test-suite.git
-	# Pinned to a dated RELEASE tag, not the `data` branch. Upstream's ReadMe is
+	# The pin is the gitlink SHA recorded in the parent commit, and it points at
+	# a dated RELEASE TAG, never at the tip of a branch. Upstream's ReadMe is
 	# explicit: "You shouldn't use the data branch directly as the branch
 	# contains unreleased commits which might be wrong, and it is squashed and
 	# force pushed from time to time." Tracking that branch made the conformance
 	# corpus -- the thing the 100% floor defends -- a force-pushable moving
-	# target. `data-2022-01-17` is the newest release as of this pin.
-	branch = data-2022-01-17
+	# target.
+	#
+	# `branch` therefore does NOT name the pin, and `branch = data-2022-01-17`
+	# was a mistake on two counts. It duplicated the pin in a second place that
+	# had already drifted (the gitlink named 6ad3d2c, a commit on the squashed
+	# `data` branch; the tag names 6e6c296 -- identical trees, so the corpus was
+	# right and only the anchor was wrong). And it could never work: git reads
+	# `branch` for exactly one thing, `git submodule update --remote`, which
+	# resolves it to refs/remotes/<remote>/<branch>. The default refspec
+	# (+refs/heads/*:refs/remotes/origin/*) fills that namespace from refs/heads/*
+	# alone, so a TAG name there can never resolve, and every --remote run died
+	# with "Unable to find refs/remotes/origin/data-2022-01-17 revision in
+	# submodule path".
+	#
+	# `branch = data` is kept for one reason only: to keep a hand-typed
+	# `--remote` on the corpus. Delete this key and --remote falls back to the
+	# remote's default branch, `main` -- which is the test suite's SOURCE repo
+	# (Makefile, src/, TestML) and holds zero `<id>/in.yaml` directories, so it
+	# silently swaps the 402 cases for something the harness cannot read. Landing
+	# on the `data` tip is merely unpinned; landing on `main` is broken.
+	branch = data
+
+	# Which family of tags this submodule tracks. Policy, not state, so unlike
+	# the pin it does belong in config. `mise run submodules --latest` fetches
+	# tags and checks out the newest match; git itself ignores this key.
+	release-tag-glob = data-*
+
+	# Working-tree noise inside the corpus is not this repo's business: the
+	# submodule is a read-only fixture, so a stray edit or a build artefact under
+	# data/ has no reason to appear in `git status` here.
+	#
+	# `dirty`, NOT `all`. Both silence modified and untracked files inside the
+	# submodule, but `all` additionally hides a moved GITLINK -- which would gut
+	# the "the pin MOVED" report in `mise run submodules --latest`, since that
+	# check is a plain `git diff HEAD -- <submodule paths>`. Advancing a release
+	# would then look like a no-op and the new pin would never get committed.
+	#
+	# Override per-clone with `git config submodule.<name>.ignore none`, or for
+	# one command with `git status --ignore-submodules=none`.
+	ignore = dirty

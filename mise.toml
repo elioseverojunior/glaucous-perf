@@ -424,7 +424,7 @@ flag "--path <path>" help="Worktree location (default: <repo>-wt-<branch> alongs
 
 [tasks."setup:submodules"]
 alias = ["submodules", "setup:git:submodules"]
-description = "Ensure git submodules are initialised; --latest also advances them to the newest commit on their tracked branch"
+description = "Ensure git submodules are initialised; --latest also advances each to the newest release tag in its configured family"
 run = '''
 #!/usr/bin/env bash
 
@@ -448,51 +448,107 @@ if git submodule status --recursive 2>/dev/null | grep -q '^-'; then
     exit 0
 fi
 
-# Already initialised. Advancing to the newest upstream commit is OPT-IN, and
-# deliberately not what `setup` triggers: `--remote` moves the recorded SHA, so
-# it dirties the working tree and changes which corpus the conformance gate runs
-# against. Doing that silently on every directory change -- `[hooks] enter`
-# calls `setup`, which depends on this task -- would rewrite a pinned test
-# fixture behind your back and make the 402-case result irreproducible.
+# Already initialised. Advancing the pin is OPT-IN, and deliberately not what
+# `setup` triggers: a newer release changes which corpus the conformance gate
+# runs against, and moving the recorded SHA dirties the working tree. Doing that
+# silently on every directory change -- `[hooks] enter` calls `setup`, which
+# depends on this task -- would rewrite a pinned test fixture behind your back
+# and make the 402-case result irreproducible.
 if [ "${usage_latest:-false}" != "true" ]; then
     echo "submodules: already initialised (pass --latest to advance the pin)"
     exit 0
 fi
 
-# `--remote` tracks the branch named in .gitmodules (`data` for the YAML suite)
-# rather than the SHA recorded in the parent commit.
-echo "submodules: fetching newest commit on each tracked branch..."
-git submodule update --remote --recursive
+# Advance each submodule to the newest RELEASE TAG in the family named by its
+# `release-tag-glob` key in .gitmodules.
+#
+# Deliberately NOT `git submodule update --remote`. That flag resolves
+# `submodule.<name>.branch` against the remote-TRACKING ref
+# refs/remotes/<remote>/<branch>, and the default refspec
+# (+refs/heads/*:refs/remotes/origin/*) fills that namespace from refs/heads/*
+# alone -- tags live in refs/tags/* and are never mapped there. So naming a
+# release tag in `branch` made every --remote run die with
+#     fatal: Unable to find refs/remotes/origin/data-2022-01-17 revision in
+#     submodule path 'crates/glaucus-yaml-test-suite/data'
+# and no amount of fetching could have fixed it. Tag pinning and --remote are
+# mutually exclusive by construction, and git ships no `submodule.<name>.tag`
+# counterpart, so the walk is open-coded below.
+echo "submodules: looking for newer release tags..."
 
-# Scoped to the submodule PATHS, read from .gitmodules. Diffing the whole tree
-# instead reports any unrelated edit as a moved pin -- caught in testing, where
-# it blamed three files this task never touches.
-# An explicit counter, never `${#paths[@]}`: mise renders `run` as a Tera
-# template BEFORE bash sees it, and `{#` opens a Tera comment -- the array-length
-# form fails at render time with "Closing comment tag `#}` not found". `mapfile`
-# is avoided too, since macOS ships bash 3.2 without it.
+# One pass over .gitmodules both advances each entry and collects `paths` for
+# the diff report at the end, so the submodule list is read exactly once.
+# `--name-only` yields `submodule.<name>.path`; the name is recovered by
+# trimming both ends rather than with awk, since a submodule name is allowed to
+# contain whitespace.
 paths=()
 npaths=0
-while IFS= read -r line; do
-    if [ -n "${line}" ]; then
-        paths+=("${line}")
-        npaths=$((npaths + 1))
-    fi
-done < <(git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | awk '{print $2}')
+while IFS= read -r key; do
+    [ -n "${key}" ] || continue
+    name="${key%.path}"
+    name="${name#submodule.}"
+    sm_path="$(git config -f .gitmodules --get "submodule.${name}.path")"
+    paths+=("${sm_path}")
+    npaths=$((npaths + 1))
 
+    glob="$(git config -f .gitmodules --get "submodule.${name}.release-tag-glob" || true)"
+    if [ -z "${glob}" ]; then
+        echo "submodules: ${sm_path}: no release-tag-glob declared; left at its recorded pin"
+        continue
+    fi
+
+    # --force lets a re-cut tag move, and --prune-tags (which requires --prune)
+    # drops one deleted upstream. Both matter here: the YAML suite squashes and
+    # force-pushes, and a stale local tag cache has already produced one false
+    # "orphaned tag" alarm in this repo.
+    git -C "${sm_path}" fetch --quiet --prune --prune-tags --tags --force origin
+
+    # Lexical sort IS chronological for this family: the tags are
+    # data-YYYY-MM-DD, and zero-padded ISO-8601 dates order identically either
+    # way. Deliberately not --sort=-creatordate, under which re-cutting an old
+    # tag would jump it to the head of the queue; and not --sort=-v:refname,
+    # whose versionsort reads `-` as a prerelease separator the moment a
+    # developer sets versionsort.prereleaseSuffix in their own ~/.gitconfig.
+    tag="$(git -C "${sm_path}" tag --list "${glob}" --sort=-refname | head -1)"
+    if [ -z "${tag}" ]; then
+        echo "submodules: ${sm_path}: no tag matches '${glob}'; left at its recorded pin"
+        continue
+    fi
+
+    # Check out the TAG NAME, never its SHA: a submodule always sits on a
+    # detached HEAD anyway, and detaching at the ref is what makes
+    # `git submodule status` print `(data-2022-01-17)` rather than a bare hash,
+    # so the pinned release stays legible without a second lookup.
+    git -C "${sm_path}" checkout --quiet --detach "refs/tags/${tag}"
+    echo "submodules: ${sm_path} -> ${tag}"
+done < <(git config -f .gitmodules --name-only --get-regexp '^submodule\..*\.path$')
+
+# Scoped to the submodule PATHS. Diffing the whole tree instead reports any
+# unrelated edit as a moved pin -- caught in testing, where it blamed three
+# files this task never touches.
+#
+# `git diff HEAD`, not a bare `git diff`: the bare form compares the worktree
+# against the INDEX, so a gitlink move that anything has already staged reads as
+# clean and the report below goes silent on the very change it exists to
+# announce. Against HEAD, a staged and an unstaged pin move are both caught.
+#
+# `npaths` is an explicit counter rather than bash's array-length expansion:
+# mise renders `run` as a Tera template BEFORE bash sees it, and a brace
+# followed by a hash opens a Tera comment, so that form fails at render time
+# with "Closing comment tag not found". `mapfile` is avoided for the same class
+# of reason -- macOS ships bash 3.2, which does not have it.
 if [ "${npaths}" -eq 0 ]; then
     echo "submodules: none declared in .gitmodules"
-elif git diff --quiet -- "${paths[@]}"; then
-    echo "submodules: already at the newest commit; nothing moved"
+elif git diff HEAD --quiet -- "${paths[@]}"; then
+    echo "submodules: already on the newest release tag; nothing moved"
 else
     echo "submodules: the pin MOVED -- review and commit it deliberately:"
-    git diff --submodule=short -- "${paths[@]}" | sed 's/^/    /'
+    git diff HEAD --submodule=short -- "${paths[@]}" | sed 's/^/    /'
 fi
 '''
 shell = "bash -c"
 usage = '''
 flag "-v --verbose" help="Trace each command before running it (set -x)"
-flag "--latest" help="If already initialised, advance each submodule to the newest commit on its tracked branch (moves the pin and dirties the tree)"
+flag "--latest" help="If already initialised, advance each submodule to the newest release tag matching its .gitmodules release-tag-glob (moves the pin and dirties the tree)"
 '''
 
 # === Tool Installation ===
