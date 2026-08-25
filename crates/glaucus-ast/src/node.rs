@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 
-use glaucus_core::types::{CollectionStyle, ScalarStyle, Span, Tag};
+use glaucus_core::types::{CollectionStyle, ScalarStyle, Span, Tag, YamlVersion};
 
 // ─── Representation Graph ───────────────────────────────────────────
 
@@ -70,6 +70,74 @@ impl<'a> Node<'a> {
             Node::Scalar(s) => Some(&s.value),
             _ => None,
         }
+    }
+
+    /// The scalar's text if this is a **plain** (unquoted) scalar.
+    ///
+    /// Quoting is the author stating that the value is text, so every typed
+    /// accessor below declines a quoted scalar. This helper is what enforces
+    /// that: `"true"` is a string, not a boolean, and `""` is the empty string,
+    /// not null.
+    fn plain_text(&self) -> Option<&str> {
+        match self {
+            Node::Scalar(s) if s.style == ScalarStyle::Plain => Some(&s.value),
+            _ => None,
+        }
+    }
+
+    /// Returns `true` if this is a plain scalar resolving to null.
+    ///
+    /// That is `null`, `Null`, `NULL`, `~`, or the empty plain scalar. A quoted
+    /// `"null"` is the four-character string and returns `false`, as does any
+    /// collection.
+    #[must_use]
+    pub fn is_null(&self) -> bool {
+        self.plain_text().is_some_and(glaucus_core::schema::is_null)
+    }
+
+    /// Resolves this node as a boolean, or `None`.
+    ///
+    /// **YAML 1.2 resolution only.** A `Node` carries no document version, so the
+    /// 1.1 spellings — `yes`, `on`, `y` and their negatives — are strings here.
+    /// Those stay with the deserialiser, which learns the version from a `%YAML`
+    /// directive; inventing an answer without that information would be the
+    /// Norway problem by another route.
+    ///
+    /// Matching is case-sensitive: `true`, `True` and `TRUE` resolve, `tRuE` does
+    /// not.
+    #[must_use]
+    pub fn as_bool(&self) -> Option<bool> {
+        self.plain_text()
+            .and_then(|t| glaucus_core::schema::resolve_bool(t, YamlVersion::V1_2))
+    }
+
+    /// Resolves this node as a signed integer, or `None`.
+    ///
+    /// Accepts the Core Schema radix prefixes: `0x`/`0X` and `0o`/`0O`. A bare
+    /// leading zero is decimal — `017` is seventeen.
+    #[must_use]
+    pub fn as_i64(&self) -> Option<i64> {
+        self.plain_text()
+            .and_then(glaucus_core::schema::resolve_int)
+    }
+
+    /// Resolves this node as an unsigned integer, or `None`.
+    ///
+    /// A leading `-` is refused outright, so `-0` does not become zero.
+    #[must_use]
+    pub fn as_u64(&self) -> Option<u64> {
+        self.plain_text()
+            .and_then(glaucus_core::schema::resolve_uint)
+    }
+
+    /// Resolves this node as a float, or `None`.
+    ///
+    /// Only the dotted infinity and NaN forms resolve. Bare `inf`, `infinity` and
+    /// `nan` are strings under YAML 1.2, whatever Rust's own parser accepts.
+    #[must_use]
+    pub fn as_f64(&self) -> Option<f64> {
+        self.plain_text()
+            .and_then(glaucus_core::schema::resolve_float)
     }
 
     /// Returns a reference to the sequence items, if this is a sequence node.
@@ -366,5 +434,129 @@ mod tests {
         });
         assert!(map.is_mapping());
         assert_eq!(map.as_mapping().unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod typed_accessor_tests {
+    use crate::node::Node;
+
+    fn node(src: &str) -> Node<'static> {
+        crate::composer::Composer::new(src)
+            .next()
+            .unwrap()
+            .unwrap()
+            .into_owned()
+    }
+
+    /// The scalar under key `v`, so quoting survives composition.
+    fn v(src: &str) -> Node<'static> {
+        node(&format!("v: {src}\n"))
+            .as_mapping()
+            .unwrap()
+            .first()
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn plain_scalars_resolve() {
+        assert!(v("null").is_null());
+        assert!(v("~").is_null());
+        assert_eq!(v("true").as_bool(), Some(true));
+        assert_eq!(v("TRUE").as_bool(), Some(true));
+        assert_eq!(v("false").as_bool(), Some(false));
+        assert_eq!(v("42").as_i64(), Some(42));
+        assert_eq!(v("42").as_u64(), Some(42));
+        assert_eq!(v("1.5").as_f64(), Some(1.5));
+    }
+
+    #[test]
+    fn radix_prefixes_resolve_through_both_integer_accessors() {
+        assert_eq!(v("0x1F").as_i64(), Some(31));
+        assert_eq!(v("0x1F").as_u64(), Some(31));
+        assert_eq!(v("0o17").as_i64(), Some(15));
+        assert_eq!(
+            v("017").as_i64(),
+            Some(17),
+            "a bare leading zero is decimal"
+        );
+    }
+
+    #[test]
+    fn negative_resolves_as_signed_but_not_unsigned() {
+        assert_eq!(v("-1").as_i64(), Some(-1));
+        assert_eq!(v("-1").as_u64(), None);
+        assert_eq!(v("-0").as_u64(), None, "`-0` must not become zero");
+    }
+
+    /// Quoting is the author stating the value is text. Every typed accessor must
+    /// check the style, not just the characters.
+    #[test]
+    fn quoted_scalars_decline_every_typed_accessor() {
+        for src in ["\"true\"", "'true'"] {
+            let n = v(src);
+            assert_eq!(n.as_bool(), None, "{src} is text");
+            assert_eq!(n.as_str(), Some("true"), "{src} still reads as a string");
+        }
+        assert_eq!(v("\"42\"").as_i64(), None);
+        assert_eq!(v("\"42\"").as_u64(), None);
+        assert_eq!(v("\"1.5\"").as_f64(), None);
+        assert!(!v("\"null\"").is_null(), "a quoted null is a string");
+        assert!(
+            !v("\"\"").is_null(),
+            "an empty quoted scalar is the empty string"
+        );
+    }
+
+    #[test]
+    fn an_empty_plain_scalar_is_null() {
+        assert!(v("").is_null());
+    }
+
+    #[test]
+    fn collections_decline_every_typed_accessor() {
+        for src in ["[1]", "{a: 1}"] {
+            let n = v(src);
+            assert!(!n.is_null(), "{src}");
+            assert_eq!(n.as_bool(), None, "{src}");
+            assert_eq!(n.as_i64(), None, "{src}");
+            assert_eq!(n.as_u64(), None, "{src}");
+            assert_eq!(n.as_f64(), None, "{src}");
+        }
+    }
+
+    /// A `Node` carries no document version, so 1.1 boolean spellings are strings
+    /// here. Resolving them would be the Norway problem by another route: the
+    /// deserialiser answers differently because it can see the `%YAML` directive.
+    #[test]
+    fn yaml_1_1_boolean_spellings_are_strings_on_a_node() {
+        for src in ["yes", "no", "on", "off", "y", "n", "Yes", "NO"] {
+            assert_eq!(v(src).as_bool(), None, "{src} is a string on a Node");
+            assert_eq!(v(src).as_str(), Some(src));
+        }
+    }
+
+    #[test]
+    fn boolean_matching_is_case_sensitive() {
+        assert_eq!(v("tRuE").as_bool(), None);
+        assert_eq!(v("fAlSe").as_bool(), None);
+    }
+
+    /// #26 travels with the resolvers: bare words are strings, dotted forms are
+    /// floats.
+    #[test]
+    fn bare_inf_and_nan_are_strings_dotted_forms_are_floats() {
+        for src in ["inf", "Infinity", "nan"] {
+            assert_eq!(v(src).as_f64(), None, "{src} is a string");
+        }
+        assert!(v(".inf").as_f64().is_some_and(f64::is_infinite));
+        assert!(
+            v("-.inf")
+                .as_f64()
+                .is_some_and(|f| f.is_infinite() && f.is_sign_negative())
+        );
+        assert!(v(".nan").as_f64().is_some_and(f64::is_nan));
     }
 }
