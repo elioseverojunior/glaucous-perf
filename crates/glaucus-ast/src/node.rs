@@ -137,6 +137,90 @@ impl<'a> Node<'a> {
         Some(current)
     }
 
+    /// Pushes every descendant of `self`, and `self` itself, onto `out`.
+    ///
+    /// Iterative, over an explicit worklist. A parsed tree cannot exceed
+    /// `glaucus_core::limits::MAX_SAFE_DEPTH` (192), so recursion would in fact be
+    /// safe here — but that ceiling exists precisely BECAUSE composition is
+    /// recursive, and #37 wants that removed. A new recursive walk added now is
+    /// one more site to convert later, and `Node::clone` (#36) shows how they
+    /// accumulate. A worklist costs nothing here, so it is what this uses.
+    fn collect_self_and_descendants<'n>(&'n self, out: &mut Vec<&'n Self>) {
+        let mut stack = vec![self];
+        while let Some(node) = stack.pop() {
+            out.push(node);
+            match node {
+                Node::Sequence(s) => stack.extend(s.items.iter().rev()),
+                Node::Mapping(m) => stack.extend(m.entries.iter().map(|(_, v)| v).rev()),
+                Node::Scalar(_) => {}
+            }
+        }
+    }
+
+    /// Resolves a path, returning every node it matches, in document order.
+    ///
+    /// Accepts the same syntax as [`get_path`](Self::get_path), plus `..` for
+    /// recursive descent. Without a `..` the result holds at most one element and
+    /// agrees with `get_path`.
+    ///
+    /// `..name` means "match `name` HERE, **or** anywhere below here" — matching
+    /// at the current level too, so
+    ///
+    /// ```text
+    /// a: 1
+    /// b:
+    ///   a: 2
+    /// ```
+    ///
+    /// finds both `a`s, not only the nested one.
+    ///
+    /// No match is an empty `Vec`, not an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let node = glaucus_ast::composer::compose_one(
+    ///     "a: 1\nb:\n  a: 2\n  c:\n    a: 3\n",
+    /// )
+    /// .unwrap();
+    ///
+    /// let found: Vec<i64> = node.query("..a").iter().filter_map(|n| n.as_i64()).collect();
+    /// assert_eq!(found, vec![1, 2, 3]);
+    ///
+    /// // Without `..` it agrees with get_path.
+    /// assert_eq!(node.query("b.a").len(), 1);
+    /// assert!(node.query("nope").is_empty());
+    /// ```
+    #[must_use]
+    pub fn query(&self, path: &str) -> Vec<&Self> {
+        let segments = parse_path(path);
+        let mut frontier: Vec<&Self> = vec![self];
+
+        for segment in segments {
+            let mut next = Vec::new();
+            if segment == Segment::Descend {
+                // Descent widens the frontier to every node at or below each
+                // current node. The following segment then matches against all of
+                // them, which is what makes `..a` find `a` here AND below.
+                for node in &frontier {
+                    node.collect_self_and_descendants(&mut next);
+                }
+            } else {
+                for node in &frontier {
+                    if let Some(child) = node.step(segment) {
+                        next.push(child);
+                    }
+                }
+            }
+            frontier = next;
+            if frontier.is_empty() {
+                return Vec::new();
+            }
+        }
+
+        frontier
+    }
+
     /// The scalar's text if this is a **plain** (unquoted) scalar.
     ///
     /// Quoting is the author stating that the value is text, so every typed
@@ -720,5 +804,103 @@ mod get_path_tests {
     fn a_descent_segment_returns_none() {
         assert!(doc().get_path("spec..name").is_none());
         assert!(doc().get_path(".spec").is_none());
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use crate::node::Node;
+
+    fn n(src: &str) -> Node<'static> {
+        crate::composer::compose_one(src).unwrap().into_owned()
+    }
+
+    fn ints(results: &[&Node<'_>]) -> Vec<i64> {
+        results.iter().filter_map(|x| x.as_i64()).collect()
+    }
+
+    /// Descent must match at the CURRENT level as well as below. Matching only
+    /// the nested one is the obvious wrong implementation.
+    #[test]
+    fn descent_matches_here_and_below() {
+        let d = n("a: 1\nb:\n  a: 2\n");
+        assert_eq!(ints(&d.query("..a")), vec![1, 2]);
+    }
+
+    #[test]
+    fn descent_finds_matches_at_several_depths_in_document_order() {
+        let d = n("a: 1\nb:\n  a: 2\n  c:\n    a: 3\n");
+        assert_eq!(ints(&d.query("..a")), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn descent_reaches_through_sequences() {
+        let d = n("items:\n  - a: 1\n  - a: 2\n  - b:\n      a: 3\n");
+        assert_eq!(ints(&d.query("..a")), vec![1, 2, 3]);
+    }
+
+    /// A path without `..` must agree with `get_path` on the same input.
+    #[test]
+    fn without_descent_it_agrees_with_get_path() {
+        let d = n("spec:\n  containers:\n    - name: app\n");
+        for path in [
+            "",
+            "spec",
+            "spec.containers",
+            "spec.containers.0.name",
+            "nope",
+            "spec.9",
+        ] {
+            let q = d.query(path);
+            match d.get_path(path) {
+                Some(one) => {
+                    assert_eq!(q.len(), 1, "{path}");
+                    assert!(std::ptr::eq(q[0], one), "{path}");
+                }
+                None => assert!(q.is_empty(), "{path} should be empty"),
+            }
+        }
+    }
+
+    #[test]
+    fn no_match_is_an_empty_vec_not_an_error() {
+        let d = n("a: 1\n");
+        assert!(d.query("..zzz").is_empty());
+        assert!(d.query("zzz").is_empty());
+    }
+
+    #[test]
+    fn descent_can_be_followed_by_more_segments() {
+        let d = n("x:\n  cfg:\n    port: 1\ny:\n  deep:\n    cfg:\n      port: 2\n");
+        assert_eq!(ints(&d.query("..cfg.port")), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_leading_descent_searches_the_whole_document() {
+        let d = n("a:\n  name: one\nb:\n  name: two\n");
+        let got: Vec<&str> = d
+            .query("..name")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(got, vec!["one", "two"]);
+    }
+
+    /// Mapping KEYS are labels, not nodes the path descends through.
+    #[test]
+    fn descent_does_not_match_mapping_keys() {
+        let d = n("name: outer\nnested:\n  name: inner\n");
+        let got: Vec<&str> = d
+            .query("..name")
+            .iter()
+            .filter_map(|x| x.as_str())
+            .collect();
+        assert_eq!(got, vec!["outer", "inner"], "values only, never keys");
+    }
+
+    #[test]
+    fn descent_on_a_scalar_root_finds_nothing_below_it() {
+        let d = n("just-a-scalar\n");
+        assert!(d.query("..a").is_empty());
     }
 }

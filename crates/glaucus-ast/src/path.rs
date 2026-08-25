@@ -72,19 +72,34 @@ pub(crate) fn parse_path(path: &str) -> Vec<Segment<'_>> {
         return Vec::new();
     }
 
-    path.split('.')
-        .map(|raw| {
-            if raw.is_empty() {
-                Segment::Descend
-            } else if let Ok(idx) = raw.parse::<usize>() {
-                // `parse::<usize>` rejects a leading `-`, which is what makes a
-                // negative number a key rather than an index.
-                Segment::Index(idx, raw)
-            } else {
-                Segment::Key(raw)
-            }
-        })
-        .collect()
+    let mut out: Vec<Segment<'_>> = Vec::new();
+
+    for raw in path.split('.') {
+        let segment = if raw.is_empty() {
+            Segment::Descend
+        } else if let Ok(idx) = raw.parse::<usize>() {
+            // `parse::<usize>` rejects a leading `-`, which is what makes a
+            // negative number a key rather than an index.
+            Segment::Index(idx, raw)
+        } else {
+            Segment::Key(raw)
+        };
+
+        // Consecutive descents collapse. Descent is idempotent -- widening to
+        // "this node and everything below it" a second time reaches nothing new,
+        // it only revisits, which would report the same match more than once.
+        //
+        // This is not a corner case: a LEADING `..` produces two empty segments,
+        // because `"..a".split('.')` is `["", "", "a"]`. Without collapsing,
+        // `..a` would descend twice and duplicate every nested match, while the
+        // otherwise identical `a..b` -- one empty segment -- would not.
+        if segment == Segment::Descend && out.last() == Some(&Segment::Descend) {
+            continue;
+        }
+        out.push(segment);
+    }
+
+    out
 }
 
 #[cfg(test)]
@@ -153,9 +168,17 @@ mod tests {
     #[test]
     fn descent_at_the_start_is_a_leading_empty_segment() {
         assert_eq!(parse_path(".a"), vec![Segment::Descend, Segment::Key("a")]);
+        // `"..a".split('.')` is `["", "", "a"]`, but the two descents collapse:
+        // descent is idempotent, so `..a` and `.a` both mean "search from here
+        // downward" and must not report nested matches twice.
+        assert_eq!(parse_path("..a"), vec![Segment::Descend, Segment::Key("a")]);
         assert_eq!(
-            parse_path("..a"),
-            vec![Segment::Descend, Segment::Descend, Segment::Key("a")]
+            parse_path("...a"),
+            vec![Segment::Descend, Segment::Key("a")]
+        );
+        assert_eq!(
+            parse_path("a..b"),
+            vec![Segment::Key("a"), Segment::Descend, Segment::Key("b")]
         );
     }
 
