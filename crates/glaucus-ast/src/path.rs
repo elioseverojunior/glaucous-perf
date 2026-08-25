@@ -22,12 +22,6 @@
 //!   `query` and rejected by plain lookup.
 //! - The empty path yields no segments and addresses the root.
 
-// Nothing consumes this yet: `Node::get_path` (#43) and `Node::query` (#44) are
-// its callers, and they are separate issues so each lands with its own tests.
-// Scoped to this module and tied to those issues rather than left open-ended --
-// delete it when #43 lands and the compiler will confirm it is no longer needed.
-#![allow(dead_code)]
-
 /// One step of a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Segment<'a> {

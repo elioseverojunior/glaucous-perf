@@ -6,6 +6,7 @@
 
 use std::borrow::Cow;
 
+use crate::path::{Segment, parse_path};
 use glaucus_core::types::{CollectionStyle, ScalarStyle, Span, Tag, YamlVersion};
 
 // ─── Representation Graph ───────────────────────────────────────────
@@ -70,6 +71,70 @@ impl<'a> Node<'a> {
             Node::Scalar(s) => Some(&s.value),
             _ => None,
         }
+    }
+
+    /// Follows one path segment, or `None`.
+    ///
+    /// Index-vs-key is decided by the NODE, not by the segment: a mapping asks
+    /// for the segment's text and a sequence for its value, which is how
+    /// `glaucus_cst::Document::get` behaves. So `1` addresses index 1 of a
+    /// sequence and the key `"1"` of a mapping, and the two layers agree.
+    ///
+    /// A descent segment always yields `None` here — descent branches, and a
+    /// single-result walk cannot express "any depth".
+    fn step(&self, segment: Segment<'_>) -> Option<&Self> {
+        match self {
+            Node::Mapping(m) => {
+                let key = segment.as_key()?;
+                m.entries
+                    .iter()
+                    .find(|(k, _)| k.as_str() == Some(key))
+                    .map(|(_, v)| v)
+            }
+            Node::Sequence(s) => s.items.get(segment.as_index()?),
+            Node::Scalar(_) => None,
+        }
+    }
+
+    /// Resolves a dotted, indexed path to the node it addresses.
+    ///
+    /// Segments are `.`-separated. A segment that parses as a non-negative
+    /// integer indexes a sequence; anything else names a mapping key. A negative
+    /// number is always a key, since sequence indices are non-negative. The empty
+    /// path addresses the root.
+    ///
+    /// Returns a **borrow**. `get_path("spec")` on a manifest addresses a large
+    /// subtree, and returning it by value would copy the whole thing on every
+    /// lookup — turning a config-reading loop into a copying loop.
+    ///
+    /// Returns `None` for an absent key, an out-of-range index, a step into a
+    /// scalar, or a `..` descent.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let node = glaucus_ast::composer::compose_one(
+    ///     "spec:\n  containers:\n    - name: app\n      port: 8080\n",
+    /// )
+    /// .unwrap();
+    ///
+    /// assert_eq!(
+    ///     node.get_path("spec.containers.0.name").and_then(|n| n.as_str()),
+    ///     Some("app")
+    /// );
+    /// assert_eq!(
+    ///     node.get_path("spec.containers.0.port").and_then(|n| n.as_i64()),
+    ///     Some(8080)
+    /// );
+    /// assert!(node.get_path("spec.containers.9").is_none());
+    /// ```
+    #[must_use]
+    pub fn get_path(&self, path: &str) -> Option<&Self> {
+        let mut current = self;
+        for segment in parse_path(path) {
+            current = current.step(segment)?;
+        }
+        Some(current)
     }
 
     /// The scalar's text if this is a **plain** (unquoted) scalar.
@@ -558,5 +623,102 @@ mod typed_accessor_tests {
                 .is_some_and(|f| f.is_infinite() && f.is_sign_negative())
         );
         assert!(v(".nan").as_f64().is_some_and(f64::is_nan));
+    }
+}
+
+#[cfg(test)]
+mod get_path_tests {
+    use crate::node::Node;
+
+    fn doc() -> Node<'static> {
+        crate::composer::compose_one(
+            "spec:\n  containers:\n    - name: app\n      port: 8080\n    - name: sidecar\n\
+             meta:\n  '1': numeric-key\n  '-1': negative-key\n",
+        )
+        .unwrap()
+        .into_owned()
+    }
+
+    #[test]
+    fn walks_mappings_and_sequences_in_one_path() {
+        let d = doc();
+        assert_eq!(
+            d.get_path("spec.containers.0.name").and_then(Node::as_str),
+            Some("app")
+        );
+        assert_eq!(
+            d.get_path("spec.containers.1.name").and_then(Node::as_str),
+            Some("sidecar")
+        );
+        assert_eq!(
+            d.get_path("spec.containers.0.port").and_then(Node::as_i64),
+            Some(8080)
+        );
+    }
+
+    #[test]
+    fn the_empty_path_returns_the_root() {
+        let d = doc();
+        assert!(std::ptr::eq(
+            d.get_path("").unwrap(),
+            std::ptr::from_ref(&d)
+        ));
+    }
+
+    #[test]
+    fn returns_a_borrow_of_the_subtree_not_a_copy() {
+        let d = doc();
+        let sub = d.get_path("spec.containers").unwrap();
+        assert!(std::ptr::eq(sub, d.get_path("spec.containers").unwrap()));
+        assert_eq!(sub.as_sequence().map(<[Node<'_>]>::len), Some(2));
+    }
+
+    #[test]
+    fn absent_key_returns_none() {
+        assert!(doc().get_path("spec.missing").is_none());
+    }
+
+    #[test]
+    fn index_out_of_range_returns_none() {
+        assert!(doc().get_path("spec.containers.9").is_none());
+    }
+
+    #[test]
+    fn stepping_into_a_scalar_returns_none() {
+        assert!(doc().get_path("spec.containers.0.name.deeper").is_none());
+    }
+
+    #[test]
+    fn indexing_a_mapping_that_has_no_such_key_returns_none() {
+        // `spec` is a mapping with no key "0", so an index finds nothing.
+        assert!(doc().get_path("spec.0").is_none());
+    }
+
+    /// A numeric segment must still address a numeric mapping KEY, because
+    /// `Document::get` resolves it that way. Losing this was the reason
+    /// `Segment::Index` retains the text it was parsed from (#42).
+    #[test]
+    fn a_numeric_segment_addresses_a_numeric_mapping_key() {
+        assert_eq!(
+            doc().get_path("meta.1").and_then(Node::as_str),
+            Some("numeric-key")
+        );
+    }
+
+    /// Sequence indices are non-negative, so `-1` can only be a key.
+    #[test]
+    fn a_negative_segment_addresses_a_key_never_an_index() {
+        assert_eq!(
+            doc().get_path("meta.-1").and_then(Node::as_str),
+            Some("negative-key")
+        );
+        assert!(doc().get_path("spec.containers.-1").is_none());
+    }
+
+    /// Descent branches; a single-result walk cannot express it. `query` does.
+    #[test]
+    fn a_descent_segment_returns_none() {
+        assert!(doc().get_path("spec..name").is_none());
+        assert!(doc().get_path(".spec").is_none());
     }
 }
