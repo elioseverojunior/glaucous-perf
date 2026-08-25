@@ -195,8 +195,15 @@ hooks {
 
     ["commit-msg"] {
         steps {
+            // `commit_msg_file`, NOT `files`. hk injects the former for this hook:
+            // the path git hands to commit-msg. `files` is the modified-file list,
+            // and it fails in both directions. On a dirty tree it handed `committed`
+            // several paths and the step aborted on the second one. On a clean tree
+            // it expanded to nothing, hk skipped the step as having no work, and the
+            // message went unchecked -- which is why `committed.toml`'s
+            // `subject_length` never actually gated this history.
             ["committed"] = new Step {
-                check = "mise run commit:lint --commit-file {{ files }}"
+                check = "mise run commit:lint --commit-file {{ commit_msg_file }}"
             }
         }
     }
