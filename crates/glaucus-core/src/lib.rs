@@ -15,4 +15,5 @@ pub mod error;
 pub mod limits;
 pub mod parser;
 pub mod scanner;
+pub mod schema;
 pub mod types;
