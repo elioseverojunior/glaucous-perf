@@ -34,5 +34,12 @@ glaucus-ast.workspace = true
 glaucus-core.workspace = true
 serde.workspace = true
 
+[dev-dependencies]
+# Test-only. Exercises the `!!binary` round trip through a real bytes-shaped
+# serde target. The encoder itself is hand-written, like `decode`: this crate's
+# whole runtime dependency set is glaucus-ast, glaucus-core and serde, and a
+# lookup table plus one loop does not justify a dependency's advisory surface.
+serde_bytes = "0.11"
+
 [lints]
 workspace = true

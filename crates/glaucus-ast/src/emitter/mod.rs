@@ -98,6 +98,24 @@ pub fn emit<W: fmt::Write>(node: &Node<'_>, config: &EmitterConfig, writer: &mut
     Ok(())
 }
 
+/// Renders a resolved tag URI in its shortest faithful form.
+///
+/// The composer stores a tag as its resolved URI — `!!binary` becomes
+/// `tag:yaml.org,2002:binary` — because that is what identifies the type, and
+/// what `glaucus-serde` matches against when deserialising. Writing it back
+/// verbatim produces `!<tag:yaml.org,2002:binary>`, which is valid but is not
+/// what anyone writes by hand, and is not what the document said on the way in.
+///
+/// Tags under the standard `tag:yaml.org,2002:` prefix therefore emit as the
+/// `!!` shorthand, which re-resolves to the same URI on the next parse. Anything
+/// else — an application tag, a `%TAG`-mapped prefix — is written verbatim,
+/// because the shorthand for those depends on directives this emitter does not
+/// carry.
+fn shorthand_tag(uri: &str) -> String {
+    uri.strip_prefix("tag:yaml.org,2002:")
+        .map_or_else(|| uri.to_owned(), |suffix| format!("!!{suffix}"))
+}
+
 /// Thin recursive walk that drives the push [`Emitter`]. Emits a node's
 /// tag (if any) first, then the node value via the sink's imperative API.
 fn drive_node<W: fmt::Write>(
@@ -106,7 +124,7 @@ fn drive_node<W: fmt::Write>(
     config: &EmitterConfig,
 ) -> fmt::Result {
     if let Some(tag) = node.tag() {
-        e.tag(&tag.value);
+        e.tag(&shorthand_tag(&tag.value));
     }
     match node {
         Node::Scalar(s) => e.scalar(&s.value, s.style),

@@ -53,6 +53,38 @@ const fn build_table() -> [u8; 256] {
     table
 }
 
+/// The standard base64 alphabet, indexed by sextet.
+const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encodes `bytes` as standard-alphabet base64, **padded**.
+///
+/// Padding is emitted rather than truncated. [`decode`] accepts either, but a
+/// `!!binary` scalar is a value that leaves this process, and another YAML reader
+/// may not be as lenient — so the canonical form is what goes out.
+pub(crate) fn encode(bytes: &[u8]) -> String {
+    // Four output characters per three input bytes, rounded up.
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        // Pack the chunk into the low 24 bits, zero-filling a short tail.
+        let b0 = u32::from(chunk[0]);
+        let b1 = chunk.get(1).copied().map_or(0, u32::from);
+        let b2 = chunk.get(2).copied().map_or(0, u32::from);
+        let packed = (b0 << 16) | (b1 << 8) | b2;
+
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let sextet = (packed >> (18 - 6 * i)) & 0x3F;
+                out.push(ALPHABET[sextet as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+
+    out
+}
+
 /// Decodes a standard-alphabet base64 payload.
 ///
 /// Returns `None` for any input that is not valid base64: a character outside
@@ -134,6 +166,46 @@ mod tests {
         for c in [b'*', b'@', b'-', b'_', 0u8, 0x7F, 0xFF] {
             assert_eq!(table[c as usize], super::INVALID, "byte {c:#04x}");
         }
+    }
+
+    #[test]
+    fn encodes_the_canonical_example() {
+        assert_eq!(super::encode(b"Hello World!"), "SGVsbG8gV29ybGQh");
+    }
+
+    #[test]
+    fn encode_pads_rather_than_truncating() {
+        assert_eq!(super::encode(b""), "");
+        assert_eq!(super::encode(b"a"), "YQ==");
+        assert_eq!(super::encode(b"ab"), "YWI=");
+        assert_eq!(super::encode(b"abc"), "YWJj");
+    }
+
+    /// Round-trips at every padding length. 0-7 bytes covers each remainder of
+    /// three at least twice, so a mis-shifted tail cannot hide.
+    #[test]
+    fn encode_decode_round_trips_at_every_padding_length() {
+        for len in 0..=7usize {
+            let data: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i * 37 % 256).unwrap())
+                .collect();
+            let encoded = super::encode(&data);
+            assert_eq!(
+                decode(&encoded).as_deref(),
+                Some(data.as_slice()),
+                "len {len} did not round-trip (encoded: {encoded})"
+            );
+            assert_eq!(encoded.len() % 4, 0, "len {len} produced unpadded output");
+        }
+    }
+
+    #[test]
+    fn encode_round_trips_all_byte_values() {
+        let data: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            decode(&super::encode(&data)).as_deref(),
+            Some(data.as_slice())
+        );
     }
 
     #[test]

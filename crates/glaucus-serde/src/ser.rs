@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use glaucus_ast::emitter::EmitterConfig;
 use glaucus_ast::node::{Mapping, Node, Scalar, Sequence};
-use glaucus_core::types::{CollectionStyle, Position, ScalarStyle, Span};
+use glaucus_core::types::{CollectionStyle, Position, ScalarStyle, Span, Tag};
 use serde::ser;
 
 // ─── Helper ──────────────────────────────────────────────────────────
@@ -343,12 +343,23 @@ impl ser::Serializer for NodeSerializer {
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<Node<'static>> {
-        // Emit bytes as a YAML sequence of integers (same as serde_yaml).
-        let items: Vec<Node<'static>> = v.iter().map(|b| plain(b.to_string())).collect();
-        Ok(Node::Sequence(Sequence {
-            items,
-            tag: None,
-            style: CollectionStyle::Flow,
+        // A `!!binary`-tagged scalar carrying the base64 payload.
+        //
+        // The tag is not decoration. Without it a reader cannot tell the encoded
+        // text from a string that merely looks like base64, so deserialising hands
+        // back a `String` where bytes went in and the round trip does not close.
+        // Emitting the payload untagged would be worse than not emitting it.
+        //
+        // This replaces a flow sequence of integers. That form round-tripped only
+        // through `Vec<u8>`-shaped targets and lost the fact that the value was
+        // bytes at all.
+        Ok(Node::Scalar(Scalar {
+            value: std::borrow::Cow::Owned(crate::base64::encode(v)),
+            tag: Some(Tag {
+                value: std::borrow::Cow::Borrowed("tag:yaml.org,2002:binary"),
+                span: synth_span(),
+            }),
+            style: ScalarStyle::Plain,
             span: synth_span(),
         }))
     }
@@ -832,15 +843,23 @@ mod tests {
         assert!(yaml.contains("  height: 20"));
     }
 
+    /// CHANGED by #46. This asserted a flow sequence of integers.
+    ///
+    /// That form round-tripped only through `Vec<u8>`-shaped targets and lost the
+    /// fact that the value was bytes, so `to_string` -> `from_str` on a `ByteBuf`
+    /// did not close. `!!binary` is what carries that across the boundary.
     #[test]
-    fn serialize_bytes_via_node() {
-        // Test the serialize_bytes path directly via to_node on a byte sequence.
+    fn serialize_bytes_emits_a_tagged_binary_scalar() {
         use serde::Serializer as _;
-        let node = NodeSerializer.serialize_bytes(&[1, 2, 3]).unwrap();
-        assert!(node.is_sequence());
-        let items = node.as_sequence().unwrap();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].as_str(), Some("1"));
+        let node = NodeSerializer.serialize_bytes(b"Hello World!").unwrap();
+
+        assert!(node.is_scalar());
+        assert_eq!(node.as_str(), Some("SGVsbG8gV29ybGQh"));
+        assert_eq!(
+            node.tag().map(|t| &*t.value),
+            Some("tag:yaml.org,2002:binary"),
+            "the tag is what lets a reader tell bytes from base64-looking text"
+        );
     }
 
     #[test]
@@ -1112,12 +1131,22 @@ mod tests {
         assert_eq!(to_node(&1.5f32).unwrap().as_str(), Some("1.5"));
     }
 
+    /// CHANGED by #46. This asserted a flow sequence of integers.
+    ///
+    /// That form lost the fact that the value was bytes, so a `ByteBuf` did not
+    /// survive `to_string` -> `from_str`. Bytes now serialise as a
+    /// `!!binary`-tagged scalar, which is what carries that across the boundary.
     #[test]
-    fn to_node_bytes_is_flow_sequence() {
+    fn to_node_bytes_is_a_tagged_binary_scalar() {
         use serde::Serializer as _;
         let node = NodeSerializer.serialize_bytes(&[1u8, 2, 3]).unwrap();
-        assert!(node.is_sequence());
-        assert_eq!(node.as_sequence().unwrap().len(), 3);
+        assert!(node.is_scalar());
+        assert_eq!(node.as_str(), Some("AQID"));
+        assert_eq!(
+            node.tag().map(|t| &*t.value),
+            Some("tag:yaml.org,2002:binary"),
+            "the NODE keeps the resolved URI; the emitter renders the shorthand"
+        );
     }
 
     #[test]
@@ -1179,5 +1208,93 @@ mod tests {
             err.to_string().contains("boom"),
             "expected captured I/O error, got: {err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod binary_round_trip_tests {
+    use serde_bytes::ByteBuf;
+
+    /// The round trip #46 opens with. It did not close before: bytes went out as
+    /// a sequence of integers and came back a `Vec<u8>` at best, a `String` at
+    /// worst.
+    #[test]
+    fn byte_buf_survives_to_string_then_from_str() {
+        let original = ByteBuf::from(vec![0u8, 255, 128, 1]);
+        let yaml = crate::to_string(&original).unwrap();
+        let back: ByteBuf = crate::from_str(&yaml).unwrap();
+        assert_eq!(back, original);
+    }
+
+    #[test]
+    fn round_trips_at_every_padding_length() {
+        for len in 0..=7usize {
+            let data: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i * 37 % 256).unwrap())
+                .collect();
+            let original = ByteBuf::from(data);
+            let yaml = crate::to_string(&original).unwrap();
+            let back: ByteBuf = crate::from_str(&yaml).unwrap();
+            assert_eq!(back, original, "len {len} did not round-trip via {yaml:?}");
+        }
+    }
+
+    #[test]
+    fn the_emitted_document_carries_the_binary_tag() {
+        let yaml = crate::to_string(&ByteBuf::from(b"Hello World!".to_vec())).unwrap();
+        assert!(
+            yaml.contains("!!binary"),
+            "the tag must reach the document, got {yaml:?}"
+        );
+        assert!(yaml.contains("SGVsbG8gV29ybGQh"), "got {yaml:?}");
+    }
+
+    /// `to_string` and `to_node` reach DIFFERENT serializers -- the streaming one
+    /// in `stream_ser.rs` and `NodeSerializer` here. Both emit bytes, so both must
+    /// agree, or a document's meaning depends on which entry point produced it.
+    ///
+    /// This exists because updating only one is exactly how the divergence in #38
+    /// happened, and `stream_ser`'s comment said it "mirrors" the other while
+    /// being edited independently.
+    #[test]
+    fn both_serializers_emit_the_same_binary_document() {
+        let bytes = ByteBuf::from(vec![0u8, 255, 128, 1, 7]);
+
+        let streamed = crate::to_string(&bytes).unwrap();
+        let via_node = {
+            let node = super::to_node(&bytes).unwrap();
+            glaucus_ast::emitter::emit_to_string(
+                &node,
+                &glaucus_ast::emitter::EmitterConfig::default(),
+            )
+        };
+
+        assert_eq!(
+            streamed, via_node,
+            "to_string and to_node must produce the same document"
+        );
+        assert!(streamed.contains("!!binary"), "got {streamed:?}");
+
+        // And both round-trip, which is the property the identical text is for.
+        let back: ByteBuf = crate::from_str(&streamed).unwrap();
+        assert_eq!(back, bytes);
+    }
+
+    /// Bytes nested inside a struct, not just at the root.
+    #[test]
+    fn bytes_round_trip_inside_a_struct() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Holder {
+            name: String,
+            blob: ByteBuf,
+        }
+
+        let original = Holder {
+            name: "x".to_owned(),
+            blob: ByteBuf::from(vec![1u8, 2, 3, 250]),
+        };
+        let yaml = crate::to_string(&original).unwrap();
+        let back: Holder = crate::from_str(&yaml).unwrap();
+        assert_eq!(back, original);
     }
 }

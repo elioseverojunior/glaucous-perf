@@ -235,17 +235,20 @@ impl<'a, 'c, W: fmt::Write> ser::Serializer for &'a mut StreamingSerializer<'c, 
     }
 
     fn serialize_bytes(self, v: &[u8]) -> Result<()> {
-        // Mirror NodeSerializer::serialize_bytes: a flow sequence of integers.
+        // Mirrors NodeSerializer::serialize_bytes: a `!!binary`-tagged scalar
+        // carrying the base64 payload.
+        //
+        // The two implementations MUST agree -- `to_string` reaches this one and
+        // `to_node` the other, so a document's meaning would otherwise depend on
+        // which entry point produced it. Changing one without the other is how
+        // this crate ended up with three divergent scalar resolvers (#38).
+        //
+        // The tag is not decoration: without it a reader cannot tell the encoded
+        // text from a string that merely looks like base64.
+        self.emitter.tag("!!binary");
         self.emitter
-            .begin_seq(CollectionStyle::Flow, Some(v.len()))
-            .map_err(fmt_err)?;
-        for b in v {
-            self.emitter.before_elem().map_err(fmt_err)?;
-            self.emitter
-                .scalar(&b.to_string(), ScalarStyle::Plain)
-                .map_err(fmt_err)?;
-        }
-        self.emitter.end_seq().map_err(fmt_err)
+            .scalar(&crate::base64::encode(v), ScalarStyle::Plain)
+            .map_err(fmt_err)
     }
 
     fn serialize_none(self) -> Result<()> {
