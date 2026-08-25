@@ -27,6 +27,18 @@ const fn synth_span() -> Span {
 ///
 /// Wraps a [`Node<'static>`] and implements `Serialize` + `Deserialize`.
 #[derive(Debug, Clone, PartialEq)]
+/// # The `Node` surface
+///
+/// This type derefs to the [`Node`] it wraps, so the whole node surface —
+/// `is_null`, `as_str`, `as_bool`, `as_i64`, `as_u64`, `as_f64`, `as_mapping`,
+/// `as_sequence`, `get_path` and `query` — is available directly on it. They are
+/// **not** re-declared here: inherent methods would shadow the deref with
+/// identical bodies, so the duplication would buy nothing and could drift.
+///
+/// `get_path` and `query` hand back `&Node`, not a wrapped type. Returning a
+/// borrowed wrapper would need a `repr(transparent)` pointer cast, which
+/// `#![forbid(unsafe_code)]` rules out, and the `Node` carries the same
+/// accessors — so nothing is lost.
 pub struct Value(Node<'static>);
 
 impl Value {

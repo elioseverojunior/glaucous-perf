@@ -30,6 +30,18 @@ use std::ops::Deref;
 /// | Plain scalars | heap-allocated copy | zero-copy borrow |
 /// | Use case | long-lived, send across threads | short-lived parsing |
 #[derive(Debug, Clone, PartialEq)]
+/// # The `Node` surface
+///
+/// This type derefs to the [`Node`] it wraps, so the whole node surface —
+/// `is_null`, `as_str`, `as_bool`, `as_i64`, `as_u64`, `as_f64`, `as_mapping`,
+/// `as_sequence`, `get_path` and `query` — is available directly on it. They are
+/// **not** re-declared here: inherent methods would shadow the deref with
+/// identical bodies, so the duplication would buy nothing and could drift.
+///
+/// `get_path` and `query` hand back `&Node`, not a wrapped type. Returning a
+/// borrowed wrapper would need a `repr(transparent)` pointer cast, which
+/// `#![forbid(unsafe_code)]` rules out, and the `Node` carries the same
+/// accessors — so nothing is lost.
 pub struct BorrowedValue<'a>(Node<'a>);
 
 impl<'a> BorrowedValue<'a> {
@@ -67,6 +79,29 @@ impl<'a> BorrowedValue<'a> {
     #[must_use]
     pub const fn as_node(&self) -> &Node<'a> {
         &self.0
+    }
+
+    /// Clones every borrowed scalar so the value outlives its source.
+    ///
+    /// A `BorrowedValue` cannot escape the `&str` it was parsed from. This is the
+    /// exit: it pays the copy once, at the point the caller chooses, rather than
+    /// on every access.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use glaucus_serde::{BorrowedValue, Value};
+    ///
+    /// let owned: Value = {
+    ///     let src = String::from("port: 8080\n");
+    ///     BorrowedValue::parse(&src).unwrap().into_owned()
+    /// }; // `src` is dropped here
+    ///
+    /// assert_eq!(owned.get_path("port").and_then(|n| n.as_i64()), Some(8080));
+    /// ```
+    #[must_use]
+    pub fn into_owned(self) -> crate::value::Value {
+        crate::value::Value::new(self.0.into_owned())
     }
 
     /// Consumes self, returning the inner node.
@@ -206,5 +241,76 @@ mod tests {
                 panic!("expected scalar item");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarded_surface_tests {
+    use super::BorrowedValue;
+    use crate::value::Value;
+
+    const DOC: &str = "n: 0x1F\nneg: -1\nflag: true\nnothing: ~\ntext: hello\n\
+                       f: 1.5\nitems:\n  - a\n  - b\nnested:\n  n: 7\n";
+
+    /// Every accessor, on the borrowed type. Reached through `Deref`, which is
+    /// why they are not re-declared as inherent methods.
+    #[test]
+    fn borrowed_value_exposes_the_whole_node_surface() {
+        let src = DOC.to_owned();
+        let v = BorrowedValue::parse(&src).unwrap();
+
+        assert!(v.get_path("nothing").unwrap().is_null());
+        assert_eq!(v.get_path("text").unwrap().as_str(), Some("hello"));
+        assert_eq!(v.get_path("flag").unwrap().as_bool(), Some(true));
+        assert_eq!(v.get_path("neg").unwrap().as_i64(), Some(-1));
+        assert_eq!(v.get_path("neg").unwrap().as_u64(), None);
+        assert_eq!(v.get_path("f").unwrap().as_f64(), Some(1.5));
+        assert!(v.as_mapping().is_some());
+        assert_eq!(
+            v.get_path("items").unwrap().as_sequence().map(<[_]>::len),
+            Some(2)
+        );
+        assert_eq!(v.query("..n").len(), 2);
+    }
+
+    /// Confirms the chain reaches the core resolvers: a bare `parse::<i64>()`
+    /// would not know `0x`.
+    #[test]
+    fn radix_prefixed_integers_resolve_through_the_forwarded_accessor() {
+        let src = DOC.to_owned();
+        let v = BorrowedValue::parse(&src).unwrap();
+        assert_eq!(v.get_path("n").unwrap().as_i64(), Some(31));
+        assert_eq!(v.get_path("n").unwrap().as_u64(), Some(31));
+    }
+
+    /// The borrow must genuinely end, so the source is dropped inside the block.
+    #[test]
+    fn into_owned_survives_the_source_being_dropped() {
+        let owned: Value = {
+            let src = DOC.to_owned();
+            BorrowedValue::parse(&src).unwrap().into_owned()
+        };
+
+        assert_eq!(owned.get_path("n").unwrap().as_i64(), Some(31));
+        assert_eq!(owned.get_path("text").unwrap().as_str(), Some("hello"));
+        assert_eq!(owned.query("..n").len(), 2);
+    }
+
+    #[test]
+    fn owned_value_exposes_the_whole_node_surface() {
+        let v: Value = crate::from_str(DOC).unwrap();
+
+        assert!(v.get_path("nothing").unwrap().is_null());
+        assert_eq!(v.get_path("text").unwrap().as_str(), Some("hello"));
+        assert_eq!(v.get_path("flag").unwrap().as_bool(), Some(true));
+        assert_eq!(v.get_path("n").unwrap().as_i64(), Some(31));
+        assert_eq!(v.get_path("neg").unwrap().as_u64(), None);
+        assert_eq!(v.get_path("f").unwrap().as_f64(), Some(1.5));
+        assert!(v.as_mapping().is_some());
+        assert_eq!(
+            v.get_path("items").unwrap().as_sequence().map(<[_]>::len),
+            Some(2)
+        );
+        assert_eq!(v.query("..n").len(), 2);
     }
 }
