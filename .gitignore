@@ -135,9 +135,12 @@ venv
 
 ## Mise ###
 
-# mise.local.toml is machine-specific (written by `mise run setup`); mise.lock is
-# committed on purpose, because [settings] lockfile = true pins tool versions.
+# mise.local.toml is machine-specific (written by `mise run setup`), and so is the
+# lockfile mise derives from it -- `lockfile = true` writes one PER config file, so
+# `setup` produces mise.local.lock alongside it. mise.lock is committed on purpose,
+# for the same setting: it pins the tool versions the whole project resolves.
 /mise.local.toml
+/mise.local.lock
 
 ## Development Tools
 
