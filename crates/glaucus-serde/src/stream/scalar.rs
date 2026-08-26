@@ -376,4 +376,79 @@ mod tests {
                 .is_err()
         );
     }
+
+    // --- typed entry points ------------------------------------------------
+    //
+    // `value.rs` always routes through `deserialize_any`, so these are reached
+    // only when a caller asks for a concrete numeric type directly. Their
+    // failure arms had no coverage until #53 gave the impl its first real
+    // caller and the compiler started emitting it.
+
+    /// Reports which `visit_*` the deserialiser chose.
+    ///
+    /// `Any` cannot answer this: it has no `u64` variant, and adding one would
+    /// change what every other test through it asserts.
+    struct WhichVisit;
+
+    impl serde::de::Visitor<'_> for WhichVisit {
+        type Value = &'static str;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("any scalar")
+        }
+
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok("i64")
+        }
+
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok("u64")
+        }
+    }
+
+    #[test]
+    fn deserialize_any_picks_u64_only_beyond_i64_range() {
+        // `u64::deserialize` would route through `deserialize_u64` and prove
+        // nothing about the `deserialize_any` resolution ladder, which is the
+        // path every collection element takes.
+        assert_eq!(plain("1").deserialize_any(WhichVisit).unwrap(), "i64");
+        assert_eq!(
+            plain("9223372036854775807")
+                .deserialize_any(WhichVisit)
+                .unwrap(),
+            "i64"
+        );
+        assert_eq!(
+            plain("18446744073709551615")
+                .deserialize_any(WhichVisit)
+                .unwrap(),
+            "u64"
+        );
+    }
+
+    #[test]
+    fn a_plain_scalar_beyond_i64_resolves_as_u64() {
+        assert_eq!(
+            u64::deserialize(plain("18446744073709551615")).unwrap(),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn asking_for_an_integer_rejects_non_integer_text() {
+        let msg = plain("abc")
+            .deserialize_i64(serde::de::IgnoredAny)
+            .expect_err("non-integer text deserialized as i64")
+            .to_string();
+        assert!(msg.contains("expected integer, found `abc`"), "{msg}");
+    }
+
+    #[test]
+    fn asking_for_a_float_rejects_non_float_text() {
+        let msg = plain("abc")
+            .deserialize_f64(serde::de::IgnoredAny)
+            .expect_err("non-float text deserialized as f64")
+            .to_string();
+        assert!(msg.contains("expected float, found `abc`"), "{msg}");
+    }
 }

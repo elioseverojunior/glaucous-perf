@@ -109,6 +109,25 @@ const CORPUS: &[Case] = &[
         name: "non-string-mapping-keys",
         yaml: "1: one\ntrue: yes-key\n0x1F: hex-key\n",
     },
+    Case {
+        name: "empty-collections",
+        yaml: "a: []\nb: {}\nc: [[], {}]\n",
+    },
+    Case {
+        // The two styles denote the same value, so any engine that treats a
+        // flow collection as a different shape than its block spelling shows up
+        // here rather than in whichever downstream test happened to use one.
+        name: "flow-and-block-agree",
+        yaml: "flow: {a: [1, 2], b: {c: 3}}\nblock:\n  a:\n    - 1\n    - 2\n  b:\n    c: 3\n",
+    },
+    Case {
+        name: "sequence-of-mappings",
+        yaml: "- a: 1\n  b: 2\n- a: 3\n  b: 4\n",
+    },
+    Case {
+        name: "single-element-collections",
+        yaml: "a: [1]\nb: {c: 1}\nd:\n  - 1\n",
+    },
     // ─── anchors and aliases ────────────────────────────────────────
     Case {
         name: "anchor-on-scalar",
@@ -155,6 +174,12 @@ const CORPUS: &[Case] = &[
     Case {
         name: "binary-tag",
         yaml: "a: !!binary SGVsbG8gV29ybGQh\n",
+    },
+    Case {
+        // Verbatim tags arrive with an empty handle, a shape no other case in
+        // this corpus produces.
+        name: "verbatim-tags",
+        yaml: "a: !<tag:yaml.org,2002:str> 123\nb: !<!local> x\n",
     },
 ];
 
@@ -229,7 +254,16 @@ fn tree_and_streaming_paths_agree_on_malformed_input() {
 /// the conformance suite.
 #[test]
 fn the_corpus_is_not_empty() {
-    assert_eq!(CORPUS.len(), 20, "the corpus should hold twenty cases");
+    // A FLOOR, not an equality. The guard exists to stop the corpus being
+    // gutted into a vacuous pass -- every case deleted and the suite still
+    // green. An exact count would also reject every legitimate addition, so it
+    // degrades into mechanical number-bumping and stops being read. Ratchet
+    // this upward as cases are added; never lower it to make a deletion pass.
+    assert!(
+        CORPUS.len() >= 25,
+        "corpus shrank to {} cases; it should only grow",
+        CORPUS.len()
+    );
     assert!(!MALFORMED.is_empty(), "malformed cases must be covered too");
 
     let mut names: Vec<&str> = CORPUS.iter().chain(MALFORMED).map(|c| c.name).collect();

@@ -9,3 +9,4 @@
 
 pub(crate) mod scalar;
 pub(crate) mod tape;
+pub(crate) mod value;
