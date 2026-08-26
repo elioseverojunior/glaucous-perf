@@ -425,6 +425,9 @@ jobs:
           RUSTFLAGS: "-D warnings"
         run: |
           set -euo pipefail
+
+          mise run test:all
+
           # Derive the crate list instead of maintaining `--exclude` flags:
           # cargo reports `publish` as [] for `publish = false` and null when
           # publishing is allowed, so this selects exactly what a consumer can
