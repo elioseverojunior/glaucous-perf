@@ -6,12 +6,6 @@ name: Rust Toolchain Setup
 
 # Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
-
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
@@ -67,6 +61,7 @@ jobs:
 
       - name: Setup mise
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        timeout-minutes: 10
         with:
           cache_key_prefix: mise
           cache_key: mise-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/mise.lock') || hashFiles('**/mise.toml') }}
