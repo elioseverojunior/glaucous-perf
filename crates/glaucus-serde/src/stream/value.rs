@@ -1219,4 +1219,174 @@ mod tests {
             "explicit keys keep document order and merged ones come after"
         );
     }
+
+    // --- resource limits (#56) ---------------------------------------------
+
+    /// Deserialises through the streaming path with caller-supplied limits.
+    fn from_yaml_with<'de, T: Deserialize<'de>>(
+        input: &'de str,
+        config: glaucus_core::error::ParserConfig,
+    ) -> Result<T, Error> {
+        let merge_keys = config.merge_keys;
+        let mut tape = Tape::with_config(input, config);
+        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, merge_keys);
+        de.skip_framing()?;
+        T::deserialize(&mut de)
+    }
+
+    /// Both engines must reach the same verdict when a budget is tight.
+    ///
+    /// Only accept-versus-reject is compared, as in the differential harness:
+    /// two engines can refuse a document for the same reason and word it
+    /// differently, and treating that as a difference would bury the real signal.
+    #[test]
+    fn limits_reach_the_same_verdict_on_both_paths() {
+        use glaucus_core::error::ParserConfig;
+        use glaucus_core::limits::ResourceLimits;
+
+        let tight = |limits: ResourceLimits| ParserConfig {
+            limits,
+            ..Default::default()
+        };
+
+        let cases: &[(&str, ParserConfig)] = &[
+            (
+                "a: &x 1\nb: &y 2\n",
+                tight(ResourceLimits {
+                    max_anchors: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: &x 1\nb: &x 2\n",
+                tight(ResourceLimits {
+                    max_anchors: 1,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: &toolong 1\n",
+                tight(ResourceLimits {
+                    max_anchor_name_length: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: &ok 1\n",
+                tight(ResourceLimits {
+                    max_anchor_name_length: 2,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: abcdefghij\n",
+                tight(ResourceLimits {
+                    max_scalar_length: 3,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: ab\n",
+                tight(ResourceLimits {
+                    max_scalar_length: 3,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: [[[[1]]]]\n",
+                tight(ResourceLimits {
+                    max_depth: 3,
+                    ..Default::default()
+                }),
+            ),
+            (
+                "a: &x 1\nb: *x\nc: *x\n",
+                tight(ResourceLimits {
+                    max_alias_expansions: 1,
+                    ..Default::default()
+                }),
+            ),
+        ];
+
+        let mut disagreements = Vec::new();
+        for (yaml, config) in cases {
+            let tree = crate::from_str_with::<Shape>(yaml, config.clone()).is_ok();
+            let streaming = from_yaml_with::<Shape>(yaml, config.clone()).is_ok();
+            if tree != streaming {
+                disagreements.push(format!(
+                    "{yaml:?}\n  tree accepted = {tree}, streaming accepted = {streaming}"
+                ));
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} limit cases disagree:\n\n{}",
+            disagreements.len(),
+            cases.len(),
+            disagreements.join("\n\n")
+        );
+    }
+
+    /// Two DELIBERATE divergences, in the same direction: streaming is stricter.
+    ///
+    /// Both come from the same fact -- the tree path materialises an anchor once
+    /// and clones the result, while streaming re-walks the events every time.
+    /// Streaming therefore sees work the tree path never performs, and bounds it.
+    /// Pinned so each difference stays a decision rather than a surprise, and so
+    /// nothing "fixes" streaming to match without weighing what is lost.
+    #[test]
+    fn streaming_is_stricter_than_the_tree_path_in_two_known_places() {
+        use glaucus_core::error::ParserConfig;
+        use glaucus_core::limits::ResourceLimits;
+
+        // 1. Depth introduced by expansion.
+        //
+        // With `max_depth: 3` the tree path refuses `[[[[1]]]]` but accepts this,
+        // materialising a six-deep tree: the parser bounded what it READ, and
+        // expansion happens afterwards. Streaming refuses it, because the
+        // expanded stream is what recurses through serde -- an unbounded one is
+        // the stack overflow #33 turned into a catchable error, and this is the
+        // path meant to become the default.
+        let deep = ParserConfig {
+            limits: ResourceLimits {
+                max_depth: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let yaml = "a: &a [[1]]\nb: [[*a]]\n";
+        assert!(
+            crate::from_str_with::<Shape>(yaml, deep.clone()).is_ok(),
+            "the tree path is expected to accept this today"
+        );
+        assert!(
+            from_yaml_with::<Shape>(yaml, deep).is_err(),
+            "streaming must bound the depth an alias introduces"
+        );
+
+        // 2. Where the billion-laughs line falls.
+        //
+        // The tree path charges each alias the size of the anchor it names, once
+        // -- 74,718 nodes here, inside the 100,000 cap, so it is accepted.
+        // Streaming charges every re-expansion, and the nine aliases at each
+        // level re-expand the level below: 7,380 expansions against a cap of
+        // 1,024. Both are real protections; they draw the line in different
+        // places, and one more level would trip the tree path too.
+        let bomb = concat!(
+            "a: &a [x,x,x,x,x,x,x,x,x]\n",
+            "b: &b [*a,*a,*a,*a,*a,*a,*a,*a,*a]\n",
+            "c: &c [*b,*b,*b,*b,*b,*b,*b,*b,*b]\n",
+            "d: &d [*c,*c,*c,*c,*c,*c,*c,*c,*c]\n",
+            "e: [*d,*d,*d,*d,*d,*d,*d,*d,*d]\n",
+        );
+        assert!(
+            crate::from_str_with::<Shape>(bomb, ParserConfig::default()).is_ok(),
+            "the tree path is expected to accept this today"
+        );
+        assert!(
+            from_yaml_with::<Shape>(bomb, ParserConfig::default()).is_err(),
+            "streaming must refuse a billion-laughs document"
+        );
+    }
 }
