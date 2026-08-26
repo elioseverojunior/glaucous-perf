@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: 2026 Elio Severo Junior <elioseverojunior@gmail.com>
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: "Install Mold Package"
+description: "Install the mold linker on Linux x64, which .cargo/config.toml requires as the linker for that target"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache mold package
+      id: mold-cache
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/mold-deb
+        key: mold-deb-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Install mold (required by .cargo/config.toml on Linux)
+      if: runner.os == 'Linux' && runner.arch == 'X64' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        if command -v mold >/dev/null 2>&1; then
+          exit 0
+        fi
+
+        mkdir -p "$HOME/.cache/mold-deb"
+        # `apt-get update` is the expensive half of this step, so it runs only
+        # when the package is not already cached.
+        if ! ls "$HOME/.cache/mold-deb"/mold_*.deb >/dev/null 2>&1; then
+          sudo apt-get update
+          (cd "$HOME/.cache/mold-deb" && apt-get download mold)
+        fi
+        sudo dpkg -i "$HOME/.cache/mold-deb"/mold_*.deb

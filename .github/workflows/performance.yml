@@ -1,36 +1,15 @@
-# SPDX-FileCopyrightText: Glaucus contributors
+# SPDX-FileCopyrightText: 2026 Elio Severo Junior <elioseverojunior@gmail.com>
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 name: Performance
 
-# Multi-architecture benchmark run. `perf-matrix` expands one platform table
-# into a job per NATIVE host -- Linux x86_64/aarch64 and macOS x86_64/aarch64 --
-# each measuring the Criterion suite where it actually runs, and `perf-report`
-# pivots the four result sets into one table.
+# Multi-architecture benchmark run: `perf-matrix` expands one platform table
+# into a job per NATIVE host, `perf-report` pivots the results into one table.
 #
-# It MEASURES; it does not gate. The per-change regression gate against the
-# `gh-pages` baseline is described at the bottom of this file and is not wired
-# up: benchmark numbers from shared CI runners move by tens of percent between
-# runs, which fails pull requests on phantom regressions. Every figure this
-# workflow publishes from a GitHub-hosted runner is marked `degraded` for the
-# same reason -- read ratios within a column, never absolute times across them.
-#
-# Security note: this workflow does not interpolate any user-controlled
-# content (issue/PR titles, commit messages, head_ref, etc.) into `run:`
-# steps. All `${{ }}` usages are either repo metadata in action inputs
-# or conditional gates; dispatch inputs reach a shell only through `env:`.
-#
-# gh-pages setup, needed ONLY if the baseline gate at the bottom is restored:
-#   1. Create an empty `gh-pages` branch:
-#        git checkout --orphan gh-pages && git rm -rf . && \
-#        git commit --allow-empty -m "init gh-pages" && \
-#        git push origin gh-pages
-#   2. In repo Settings -> Pages, point Pages at the `gh-pages` branch
-#      (optional -- only needed to view the historical dashboard).
-#   3. In repo Settings -> Actions -> General -> Workflow permissions,
-#      ensure "Read and write permissions" is enabled (required for the
-#      action to push the updated baseline).
+# It measures; it does not gate. Figures from GitHub-hosted runners are marked
+# `degraded` -- read ratios within a column, never absolute times across them.
+# Dispatch inputs reach a shell only through `env:`, never `${{ }}` inline.
 
 concurrency:
   group: perf-${{ github.workflow }}-${{ github.ref }}
@@ -144,6 +123,10 @@ jobs:
           fetch-tags: "true"
           ref: ${{ env.REF }}
 
+      # Warms the rust AND mise caches for `lint` and `msrv`. The
+      # `cargo-binstall failed` lines it emits are a fallback notice, not a
+      # failure: those crates publish no prebuilt binary, so mise source-builds
+      # them here once per mise.lock change and later jobs restore the cache.
       - name: Setup Environment
         uses: ./.github/actions/setup-rust-env
 
@@ -175,28 +158,15 @@ jobs:
   # ──────────────────────────────────────────────
   #  3.  Perf matrix — ONE platform table, expanded at dispatch time
   # ──────────────────────────────────────────────
-  # The generator. It exists because `runs-on` is the ONLY thing that decides
-  # which architecture a job measures: a matrix that crosses `os: [ubuntu-latest,
-  # macos-15]` with `arch: [x86_64, aarch64]` produces four jobs on TWO distinct
-  # machines -- the `aarch64` half lands on the same x86_64 runner as its sibling
-  # and reports x86_64 timings under an aarch64 label. Cross-compiling does not
-  # rescue it either: a benchmark has to RUN, and an aarch64 binary does not run
-  # on an x86_64 host. So arch is not a dimension here; it is a property of the
-  # runner label, and this table is the mapping.
+  # `runs-on` is the ONLY thing that decides which architecture a job measures:
+  # crossing `os` with an `arch` dimension puts both halves on the same machine
+  # and labels one of them wrong. Cross-compiling cannot rescue it either -- a
+  # benchmark has to RUN. So arch is a property of the runner label, and this
+  # table is the mapping. Labels verified 2026-08-26; macos-*-intel is the last
+  # x86_64 macOS image, available until August 2027.
   #
-  # Native runner labels (verified 2026-08-26):
-  #   ubuntu-24.04       Linux x86_64
-  #   ubuntu-24.04-arm   Linux aarch64  (GA; free for public repos)
-  #   macos-15-intel     macOS x86_64   (the LAST Intel image -- available until
-  #                                      August 2027, after which GitHub hosts no
-  #                                      x86_64 macOS at all)
-  #   macos-15           macOS aarch64  (Apple silicon)
-  #
-  # Every label is overridable through a repo variable, which is the point of
-  # keeping them in data rather than in `runs-on`. Benchmarks on shared runners
-  # are noisy enough that the numbers carry a `degraded` marker (see the
-  # preflight step below); pointing PERF_RUNNER_* at self-hosted metal is how a
-  # run becomes decision-grade without editing this file.
+  # PERF_RUNNER_* override any label: pointing them at self-hosted metal is how
+  # a run stops being `degraded`.
   perf-matrix:
     name: Perf Matrix
     # A ROOT job. It expands a table with jq -- no checkout, no toolchain, no
@@ -220,8 +190,8 @@ jobs:
           CHANNEL: ${{ inputs.toolchain || 'default' }}
           RUNNER_LINUX_X86_64: ${{ vars.PERF_RUNNER_LINUX_X86_64 || 'ubuntu-24.04' }}
           RUNNER_LINUX_AARCH64: ${{ vars.PERF_RUNNER_LINUX_AARCH64 || 'ubuntu-24.04-arm' }}
-          RUNNER_MACOS_X86_64: ${{ vars.PERF_RUNNER_MACOS_X86_64 || 'macos-15-intel' }}
-          RUNNER_MACOS_AARCH64: ${{ vars.PERF_RUNNER_MACOS_AARCH64 || 'macos-15' }}
+          RUNNER_MACOS_X86_64: ${{ vars.PERF_RUNNER_MACOS_X86_64 || 'macos-26-intel' }}
+          RUNNER_MACOS_AARCH64: ${{ vars.PERF_RUNNER_MACOS_AARCH64 || 'macos-26' }}
         run: |
           set -Eeuo pipefail
 
@@ -321,43 +291,20 @@ jobs:
           fetch-tags: "true"
           ref: ${{ env.REF }}
 
-      # The composite installs BOTH toolchains now: the pinned one from
-      # rust-toolchain.toml as the active channel, and the declared floor
-      # alongside it via `msrv-install`. That is what makes this job able to use
-      # the composite at all. The old objection -- that it built comply,
-      # ignorefile and every mise `cargo:` tool with whatever was active, and
-      # died on the first one needing a newer rustc than 1.88 --
-      #
-      #   error: cannot install package `ignorefile-cli 0.1.0`, it requires
-      #   rustc 1.95 or newer, while the currently active rustc version is 1.88.0
-      #
-      # no longer holds: the floor is never the active toolchain, so that tooling
-      # builds on the pin exactly as it does everywhere else. `dev-tools: false`
-      # and `mise-tools: ""` then skip it outright, because a `cargo check` gate
-      # has no use for a linter.
-      #
-      # The floor also stops being read twice. rust-toolchain resolves it from
-      # Cargo.toml and publishes it as `msrv`; the step below compares
-      # .clippy.toml against THAT rather than re-parsing the manifest itself.
+      # `msrv-install` puts the floor beside the pinned toolchain without making
+      # it active, so comply/ignorefile still build on the pin -- which is what
+      # lets this job use the composite at all. The floor is read once, by the
+      # action, and published as `msrv`.
       - name: Setup Environment
         id: setup
         uses: ./.github/actions/setup-rust-env
         with:
           msrv-install: "true"
-          mise-tools: ""
-          dev-tools: "false"
           cache-key-suffix: msrv
 
-      # .clippy.toml's `msrv` is the SECOND declaration of the floor, to a second
-      # tool: it makes clippy reject an API newer than the floor even though the
-      # pinned toolchain offers it -- a check that catches at lint time what this
-      # job only catches once the code is written.
-      #
-      # Nothing else compares them. Left unchecked, .clippy.toml silently keeps
-      # linting against a floor the project abandoned, which is the exact defect
-      # this job exists to prevent, one file over. A missing `msrv` is failed
-      # too, not tolerated: dropping the key would quietly switch clippy back to
-      # assuming the pinned toolchain.
+      # .clippy.toml declares the floor to clippy, and nothing else compares the
+      # two. Left unchecked it keeps linting against a floor the project
+      # abandoned; a missing key silently reverts clippy to the pinned toolchain.
       - name: Cross-check .clippy.toml against the declared floor
         env:
           MSRV: ${{ steps.setup.outputs.msrv }}
@@ -382,37 +329,19 @@ jobs:
 
       - name: Compile every publishable crate at the MSRV
         env:
-          # Selects the floor the composite installed, for every cargo/rustc
-          # call in this step. It outranks rust-toolchain.toml AND the
-          # composite's own job-wide export of the pinned channel -- which is
-          # what makes the job mean anything, because `msrv-install`
-          # deliberately never makes the floor active. Naming it here is the
-          # only thing that reaches it.
+          # Reaches the floor the composite installed; `msrv-install` never
+          # makes it active, so naming it here is the only way in.
           RUSTUP_TOOLCHAIN: ${{ steps.setup.outputs.msrv }}
-          #
-          # No RUSTFLAGS override any more. It used to be REQUIRED: this job
-          # skipped the composite and therefore had no mold, while
-          # .cargo/config.toml's `[target.x86_64-unknown-linux-gnu]` pins
-          # `-C link-arg=-fuse-ld=mold` with no fallback -- so the override
-          # existed to drop a linker that was not on the runner while keeping
-          # `-D warnings` byte-for-byte. `cargo check` got no pass on that: it
-          # still runs build scripts and compiles ~30 proc-macro crates, all of
-          # which link. The composite installs mold now, so config.toml's
-          # per-target flags apply unmodified and the warning policy is read
-          # from the one place every other job reads it.
-          #
-          # Warnings stay denied AT THE FLOOR because `lint` cannot cover this:
-          # it runs on the pinned toolchain, so a lint that fires at the floor
-          # but was renamed or removed by the pin would go unseen. The trade-off
-          # to watch as the floor and stable drift apart: an `#[allow]` naming a
-          # lint the floor has never heard of raises `unknown_lints`, which
-          # would fail a gate for a reason that says nothing about MSRV. If that
-          # day comes, set `RUSTFLAGS: ""` here rather than weakening the check.
+          # No RUSTFLAGS override: the composite installs mold, so
+          # .cargo/config.toml's per-target flags apply as-is, `-D warnings`
+          # included. Warnings stay denied at the floor because `lint` runs on
+          # the pin and cannot see a lint that only fires here.
         run: |
           set -euo pipefail
-
-          mise run test:all
-
+          # NOT `mise run test:all`: it switches to a nightly COVERAGE_TOOLCHAIN,
+          # so it would measure coverage on nightly instead of checking anything
+          # at the floor. `test:all:msrv` is the task that runs a suite AT the
+          # declared floor.
           # Derive the crate list instead of maintaining `--exclude` flags:
           # cargo reports `publish` as [] for `publish = false` and null when
           # publishing is allowed, so this selects exactly what a consumer can
@@ -476,11 +405,6 @@ jobs:
         uses: ./.github/actions/setup-rust-env
         with:
           toolchain: ${{ matrix.toolchain }}
-          # This job calls cargo, python3 and jq. Nothing else. Provisioning the
-          # 28-tool mise set here bought nothing and cost minutes of source
-          # builds per runner -- multiplied by the width of the platform matrix.
-          mise-tools: ""
-          dev-tools: "false"
           # Namespaced per platform AND per channel: these caches key on the
           # dependency set and the toolchain, and four hosts sharing one
           # namespace would otherwise trade artifacts they cannot use.
@@ -739,6 +663,14 @@ jobs:
   # ──────────────────────────────────────────────
   #  The gh-pages baseline gate — deliberately NOT wired up
   # ──────────────────────────────────────────────
+  # benchmark-action/github-action-benchmark used to run here as a single-host
+  # regression gate. Restoring it under a matrix needs three things: per-platform
+  # `benchmark-data-dir-path` (one shared dir interleaves incomparable series),
+  # serialised pushes (four jobs racing on gh-pages lose history), and
+  # `contents: write` on whichever job pushes -- absent today because every job
+  # here is read-only. docs/benchmarks/results.data.ts also reads ONE
+  # benchmarks.json, so publishing four platforms means teaching it the platform
+  # dimension first. Until then, read perf-combined.json.
   # benchmark-action/github-action-benchmark used to run here as a single-host
   # regression gate (`alert-threshold: 150%`, `fail-threshold: 200%`), pushing
   # its history to `bench-data/` on gh-pages. Restoring it under a MATRIX needs

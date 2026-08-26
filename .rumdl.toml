@@ -51,7 +51,12 @@ exclude = [
   "LICENSE.md",
 
   # Project
+  #
+  # VitePress pages: both open with `<script setup>` and render a Vue template,
+  # so MD041 and MD033 fire by construction. baseline.md is plain Markdown and
+  # stays linted.
   "docs/benchmarks/latest.md",
+  "docs/benchmarks/streaming-vs-tree.md",
 ]
 
 # Respect .gitignore files when scanning directories (default: true)
