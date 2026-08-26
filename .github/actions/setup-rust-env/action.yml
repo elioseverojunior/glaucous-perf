@@ -78,6 +78,51 @@ inputs:
       to feed Swatinem's `shared-key`.
     required: false
     default: ""
+  msrv-install:
+    description: >
+      Also install the crate's DECLARED MSRV -- `rust-version` from the
+      workspace-root Cargo.toml -- alongside the resolved toolchain, published
+      as the `msrv` output. rust-toolchain installs it at the same profile,
+      caches it with everything else, and never makes it active: no
+      `rustup default`, no RUSTUP_TOOLCHAIN export, so it is reachable only via
+      `cargo +<msrv>` or a step-level RUSTUP_TOOLCHAIN.
+
+      That separation is what lets an MSRV gate use this composite at all. A job
+      that set the floor as its ACTIVE toolchain had to skip the composite
+      entirely, because every tool below is built with whatever is active and
+      the first one that had moved on killed the job:
+
+        error: cannot install package `ignorefile-cli 0.1.0`, it requires
+        rustc 1.95 or newer, while the currently active rustc version is 1.88.0
+
+      Off by default: the toolchain is inert until a step names it, so every
+      other job would pay a download for something it never calls.
+    required: false
+    default: "false"
+  mise-tools:
+    description: >
+      Which mise `[tools]` to provision. `all` (the default) keeps mise-action
+      installing the whole set. An EMPTY string skips `mise install` entirely --
+      mise is still installed, still on PATH, and its cache is still restored,
+      but nothing is fetched. Anything else is passed to mise-action's
+      `install_args` verbatim, e.g. "aqua:hk actionlint".
+
+      This exists because `install` defaults to true in mise-action, so every
+      job using this composite provisioned all 28 pinned tools. Twenty of them
+      are `cargo:` crates and most publish no prebuilt binary, so cargo-binstall
+      fails over to compiling from source -- minutes per crate, per job, on
+      every cache miss. A benchmark job that only calls cargo, python3 and jq
+      paid all of it; across a four-platform matrix it paid it four times.
+    required: false
+    default: "all"
+  dev-tools:
+    description: >
+      Whether to install the git-sourced lint helpers, comply and ignorefile
+      (default true). Both are `cargo install --git` builds that only
+      `hk check --all` needs; a job that compiles or benchmarks has no use for
+      them and should not wait on a source build when the binary cache misses.
+    required: false
+    default: "true"
 
 outputs:
   cache-hit:
@@ -89,6 +134,13 @@ outputs:
   rust-version:
     description: "The installed Rust toolchain version (e.g. 'rustc 1.88.0 (a1b2c3d4e 2025-07-14)')"
     value: ${{ steps.rust-toolchain.outputs.name }}
+  msrv:
+    description: >
+      The DECLARED MSRV rust-toolchain read from Cargo.toml's `rust-version`.
+      Published whatever `msrv-install` is set to -- it is the same number
+      either way -- but only installed, and therefore only usable as
+      `cargo +<msrv>`, when that input is on.
+    value: ${{ steps.rust-toolchain.outputs.msrv }}
 
 runs:
   using: "composite"
@@ -184,6 +236,11 @@ runs:
         cache-key-hash: ${{ hashFiles('**/Cargo.lock') }}
         cache-key-suffix: ${{ inputs.cache-key-suffix }}
         cache-on-failure: "true"
+        # The MSRV rides along in the SAME action and the same cache layers as
+        # the pinned toolchain, rather than in a hand-rolled `rustup toolchain
+        # install` in whichever workflow needs it. One place resolves it, one
+        # cache holds it.
+        msrv-install: ${{ inputs.msrv-install }}
 
     - name: Compute cargo-bin cache key
       id: cache-names
@@ -250,7 +307,7 @@ runs:
     # cache hit as the tools above, and lands in the same `~/.cargo/bin` the
     # cache carries.
     - name: Install ignorefile (from source; no release binaries published)
-      if: ${{ steps.cargo-bin.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.dev-tools == 'true' && steps.cargo-bin.outputs.cache-hit != 'true' }}
       shell: bash
       env:
         REV: ${{ inputs.ignorefile-rev }}
@@ -272,7 +329,7 @@ runs:
     # `mise install --locked` and was cancelled still compiling. Installed here it
     # is built once per cache miss instead of once per job.
     - name: Install comply (git source; no binstallable release assets)
-      if: ${{ steps.cargo-bin.outputs.cache-hit != 'true' }}
+      if: ${{ inputs.dev-tools == 'true' && steps.cargo-bin.outputs.cache-hit != 'true' }}
       shell: bash
       env:
         REV: ${{ inputs.comply-rev }}
@@ -290,8 +347,56 @@ runs:
         tool: |
           ${{ inputs.cargo-tools }}
 
+    # Resolved in a shell step rather than inline `${{ }}`, because the obvious
+    # ternary is wrong: `inputs.mise-tools == 'all' && '' || inputs.mise-tools`
+    # returns "all", not "". GitHub's `&&` yields its right operand only when
+    # that operand is TRUTHY, and the empty string is not -- so the expression
+    # falls through to the `||` branch and passes the sentinel to mise as if it
+    # were a tool name.
+    #
+    # The scope is in the cache key for the same reason `cache-key-suffix`
+    # exists on the toolchain layers: a job installing a SUBSET would otherwise
+    # save its partial tool tree under the key the full-set jobs read, and every
+    # later job would restore a cache that is missing tools it was promised.
+    - name: Resolve mise install scope
+      id: mise-scope
+      shell: bash
+      env:
+        TOOLS: ${{ inputs.mise-tools }}
+      run: |
+        set -Eeuo pipefail
+        if [ -z "${TOOLS}" ]; then
+          install=false
+          args=""
+          scope=none
+        elif [ "${TOOLS}" = "all" ]; then
+          install=true
+          args=""
+          scope=all
+        else
+          install=true
+          args="${TOOLS}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            scope="$(printf '%s' "${TOOLS}" | sha256sum | cut -c1-16)"
+          else
+            scope="$(printf '%s' "${TOOLS}" | shasum -a 256 | cut -c1-16)"
+          fi
+        fi
+        echo "install=${install}" >> "$GITHUB_OUTPUT"
+        echo "args=${args}" >> "$GITHUB_OUTPUT"
+        echo "scope=${scope}" >> "$GITHUB_OUTPUT"
+        echo "mise install scope: ${scope} (install=${install})"
+
     - name: Setup mise
       uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
       with:
+        # `install` defaults to "true" in the action, which is what made every
+        # job provision all 28 tools. It is now the caller's decision.
+        install: ${{ steps.mise-scope.outputs.install }}
+        install_args: ${{ steps.mise-scope.outputs.args }}
+        # RESTORE always, SAVE only when this job actually installed something.
+        # A no-install job still gets whatever the cache holds -- free tools, no
+        # source builds -- and cannot write an emptier tree back over it.
+        cache_save: ${{ steps.mise-scope.outputs.install }}
         cache_key_prefix: mise
-        cache_key: mise-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/mise.lock') || hashFiles('**/mise.toml') }}
+        cache_key: mise-${{ runner.os }}-${{ runner.arch }}-${{ steps.mise-scope.outputs.scope }}-${{ hashFiles('**/mise.lock') || hashFiles('**/mise.toml') }}

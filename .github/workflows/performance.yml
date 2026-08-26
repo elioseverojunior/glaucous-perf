@@ -321,108 +321,93 @@ jobs:
           fetch-tags: "true"
           ref: ${{ env.REF }}
 
-      # READ the floor; never hardcode it. A literal version here would be a
-      # second source of truth free to disagree with Cargo.toml -- the same class
-      # of bug this job exists to catch, just relocated into the workflow.
-      - name: Read declared MSRV from Cargo.toml
-        id: msrv
-        run: |
-          set -euo pipefail
-          version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
-          if [ -z "$version" ]; then
-            echo "::error file=Cargo.toml::no rust-version found in [workspace.package]"
-            exit 1
-          fi
-
-          # Two files declare the floor to two different tools, and they have to
-          # agree. Cargo.toml's `rust-version` is the promise to consumers and
-          # what this job compiles against; .clippy.toml's `msrv` is what makes
-          # clippy REJECT an API newer than the floor even though the pinned
-          # toolchain offers it -- a check that catches at lint time what this
-          # job only catches once the code is written.
-          #
-          # Nothing else compares them. Left unchecked, .clippy.toml silently
-          # keeps linting against a floor the project abandoned, which is the
-          # exact defect this job exists to prevent, one file over. A missing
-          # `msrv` is failed too, not tolerated: dropping the key would quietly
-          # switch clippy back to assuming the pinned toolchain.
-          clippy_msrv="$(sed -n 's/^msrv[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .clippy.toml | head -n1)"
-          if [ -z "$clippy_msrv" ]; then
-            echo "::error file=.clippy.toml::no msrv key; it must declare msrv = \"${version}\" to match Cargo.toml"
-            exit 1
-          fi
-          if [ "$clippy_msrv" != "$version" ]; then
-            echo "::error file=.clippy.toml::msrv \"${clippy_msrv}\" disagrees with Cargo.toml rust-version \"${version}\""
-            exit 1
-          fi
-
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "Declared MSRV: ${version} (Cargo.toml and .clippy.toml agree)"
-
-      # Deliberately NOT ./.github/actions/setup-rust-env, which every other job
-      # here uses. That action provisions the DEVELOPMENT environment -- mold,
-      # clippy/rustfmt/llvm-tools, cargo-binstall, every mise `cargo:` tool,
-      # comply and ignorefile -- and it builds that tooling with whatever
-      # toolchain is active. Pointing it at the MSRV therefore tried to compile
-      # the tooling with 1.88, and it died on the first tool that had moved on:
+      # The composite installs BOTH toolchains now: the pinned one from
+      # rust-toolchain.toml as the active channel, and the declared floor
+      # alongside it via `msrv-install`. That is what makes this job able to use
+      # the composite at all. The old objection -- that it built comply,
+      # ignorefile and every mise `cargo:` tool with whatever was active, and
+      # died on the first one needing a newer rustc than 1.88 --
       #
       #   error: cannot install package `ignorefile-cli 0.1.0`, it requires
       #   rustc 1.95 or newer, while the currently active rustc version is 1.88.0
       #
-      # None of that tooling is part of the promise made to consumers, and a gate
-      # that fails because a lint helper wants a newer compiler reports nothing
-      # about the MSRV. So this job installs rustc and cargo at the declared
-      # floor and nothing else. rustup ships preinstalled on GitHub runners.
+      # no longer holds: the floor is never the active toolchain, so that tooling
+      # builds on the pin exactly as it does everywhere else. `dev-tools: false`
+      # and `mise-tools: ""` then skip it outright, because a `cargo check` gate
+      # has no use for a linter.
       #
-      # Dropping the composite drops mold with it, which is why the step below
-      # must name RUSTFLAGS. See there.
+      # The floor also stops being read twice. rust-toolchain resolves it from
+      # Cargo.toml and publishes it as `msrv`; the step below compares
+      # .clippy.toml against THAT rather than re-parsing the manifest itself.
+      - name: Setup Environment
+        id: setup
+        uses: ./.github/actions/setup-rust-env
+        with:
+          msrv-install: "true"
+          mise-tools: ""
+          dev-tools: "false"
+          cache-key-suffix: msrv
+
+      # .clippy.toml's `msrv` is the SECOND declaration of the floor, to a second
+      # tool: it makes clippy reject an API newer than the floor even though the
+      # pinned toolchain offers it -- a check that catches at lint time what this
+      # job only catches once the code is written.
       #
-      # No target cache either: the gate's worth is its reliability, not its
-      # speed, it runs in the first tier in parallel, and `tests`/`build` set the
-      # critical path regardless. Add one only if this ever becomes the slow job.
-      - name: Install the declared MSRV toolchain
+      # Nothing else compares them. Left unchecked, .clippy.toml silently keeps
+      # linting against a floor the project abandoned, which is the exact defect
+      # this job exists to prevent, one file over. A missing `msrv` is failed
+      # too, not tolerated: dropping the key would quietly switch clippy back to
+      # assuming the pinned toolchain.
+      - name: Cross-check .clippy.toml against the declared floor
         env:
-          MSRV: ${{ steps.msrv.outputs.version }}
+          MSRV: ${{ steps.setup.outputs.msrv }}
         run: |
           set -euo pipefail
-          rustup toolchain install "$MSRV" --profile minimal --no-self-update
-          rustup run "$MSRV" rustc --version
+          if [ -z "${MSRV}" ]; then
+            echo "::error file=Cargo.toml::rust-toolchain resolved no rust-version from [workspace.package]"
+            exit 1
+          fi
+
+          clippy_msrv="$(sed -n 's/^msrv[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .clippy.toml | head -n1)"
+          if [ -z "${clippy_msrv}" ]; then
+            echo "::error file=.clippy.toml::no msrv key; it must declare msrv = \"${MSRV}\" to match Cargo.toml"
+            exit 1
+          fi
+          if [ "${clippy_msrv}" != "${MSRV}" ]; then
+            echo "::error file=.clippy.toml::msrv \"${clippy_msrv}\" disagrees with Cargo.toml rust-version \"${MSRV}\""
+            exit 1
+          fi
+
+          echo "Declared MSRV: ${MSRV} (Cargo.toml and .clippy.toml agree)"
 
       - name: Compile every publishable crate at the MSRV
         env:
-          # Selects the toolchain installed above for every cargo/rustc call in
-          # this step; it outranks rust-toolchain.toml. This is the override that
-          # makes the job mean anything.
-          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
-          # REQUIRED, not tidiness. .cargo/config.toml's
-          # `[target.x86_64-unknown-linux-gnu]` sets
-          # `["-D", "warnings", "-C", "link-arg=-fuse-ld=mold"]`, and mold is
-          # installed by setup-rust-env -- which this job deliberately does not
-          # run. A RUSTFLAGS env var REPLACES that list rather than merging into
-          # it, so naming the flag here keeps the warning policy byte-for-byte
-          # while dropping a linker that is not on this runner.
+          # Selects the floor the composite installed, for every cargo/rustc
+          # call in this step. It outranks rust-toolchain.toml AND the
+          # composite's own job-wide export of the pinned channel -- which is
+          # what makes the job mean anything, because `msrv-install`
+          # deliberately never makes the floor active. Naming it here is the
+          # only thing that reaches it.
+          RUSTUP_TOOLCHAIN: ${{ steps.setup.outputs.msrv }}
           #
-          # `cargo check` does NOT get a pass on that: it still builds and RUNS
-          # build scripts, and still compiles proc-macro crates, both of which
-          # link. This graph has ~30 of them (serde_derive, proc-macro2, quote,
-          # wasm-bindgen-macro, ...). Delete this line and the job fails at the
-          # first one, for a reason that has nothing to do with the MSRV.
-          #
-          # No `--target` is passed, so RUSTFLAGS reaches those host artifacts
-          # too, which is exactly what makes the override work.
+          # No RUSTFLAGS override any more. It used to be REQUIRED: this job
+          # skipped the composite and therefore had no mold, while
+          # .cargo/config.toml's `[target.x86_64-unknown-linux-gnu]` pins
+          # `-C link-arg=-fuse-ld=mold` with no fallback -- so the override
+          # existed to drop a linker that was not on the runner while keeping
+          # `-D warnings` byte-for-byte. `cargo check` got no pass on that: it
+          # still runs build scripts and compiles ~30 proc-macro crates, all of
+          # which link. The composite installs mold now, so config.toml's
+          # per-target flags apply unmodified and the warning policy is read
+          # from the one place every other job reads it.
           #
           # Warnings stay denied AT THE FLOOR because `lint` cannot cover this:
-          # it runs on the pinned toolchain, so a lint that fires on 1.88 but was
-          # renamed or removed by the pin would go unseen. Verified clean -- the
-          # check below passes with zero warnings on 1.88.
-          #
-          # The trade-off to watch as the floor and stable drift apart: an
-          # `#[allow]` naming a lint 1.88 has never heard of raises
-          # `unknown_lints`, which would fail a gate that blocks `release` for a
-          # reason that says nothing about MSRV. If that day comes, set this to
-          # "" rather than weakening the compile check -- `lint` still owns the
-          # warning gate on the pinned toolchain.
-          RUSTFLAGS: "-D warnings"
+          # it runs on the pinned toolchain, so a lint that fires at the floor
+          # but was renamed or removed by the pin would go unseen. The trade-off
+          # to watch as the floor and stable drift apart: an `#[allow]` naming a
+          # lint the floor has never heard of raises `unknown_lints`, which
+          # would fail a gate for a reason that says nothing about MSRV. If that
+          # day comes, set `RUSTFLAGS: ""` here rather than weakening the check.
         run: |
           set -euo pipefail
 
@@ -491,6 +476,11 @@ jobs:
         uses: ./.github/actions/setup-rust-env
         with:
           toolchain: ${{ matrix.toolchain }}
+          # This job calls cargo, python3 and jq. Nothing else. Provisioning the
+          # 28-tool mise set here bought nothing and cost minutes of source
+          # builds per runner -- multiplied by the width of the platform matrix.
+          mise-tools: ""
+          dev-tools: "false"
           # Namespaced per platform AND per channel: these caches key on the
           # dependency set and the toolchain, and four hosts sharing one
           # namespace would otherwise trade artifacts they cannot use.
