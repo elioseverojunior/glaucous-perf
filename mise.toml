@@ -38,6 +38,7 @@ lockfile = true
 not_found_auto_install = true
 python.uv_venv_auto = "create|source"
 quiet = true
+locked = false
 ### Debug
 #verbose = true
 #log_level = "debug"

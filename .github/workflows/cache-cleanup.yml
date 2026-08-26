@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Glaucus contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Cache Cleanup
+
+# Deletes GitHub Actions caches. Every job here rebuilds what it needs, so the
+# only cost of a purge is one slow run per workflow.
+
+concurrency:
+  group: cache-cleanup-${{ github.ref }}
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "Delete only caches whose key contains this; empty deletes all"
+        type: string
+        default: ""
+      dry_run:
+        description: "List what would be deleted and stop"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  purge:
+    name: Purge
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    permissions:
+      actions: write # deleting a cache is an Actions write
+    steps:
+      - name: Delete caches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PATTERN: ${{ inputs.pattern }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -Eeuo pipefail
+
+          # --limit is capped at 100 per call, so page until a pass deletes
+          # nothing. jq filters by key when a pattern is given.
+          total=0
+          while :; do
+            rows="$(gh cache list --repo "${REPO}" --limit 100 --json id,key,sizeInBytes \
+              | jq -c --arg p "${PATTERN}" '[.[] | select($p == "" or (.key | contains($p)))]')"
+            count="$(jq 'length' <<<"${rows}")"
+            [ "${count}" -eq 0 ] && break
+
+            jq -r '.[] | "  \(.key)  (\((.sizeInBytes / 1048576 * 10 | floor) / 10) MiB)"' <<<"${rows}"
+            total=$((total + count))
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "dry run: ${total} cache(s) would be deleted"
+              break
+            fi
+
+            jq -r '.[].id' <<<"${rows}" | while read -r id; do
+              gh cache delete "${id}" --repo "${REPO}"
+            done
+          done
+
+          if [ "${total}" -eq 0 ]; then
+            echo "no caches matched" | tee -a "$GITHUB_STEP_SUMMARY"
+          elif [ "${DRY_RUN}" = "true" ]; then
+            echo "Dry run: ${total} cache(s) match \`${PATTERN:-*}\`" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Deleted ${total} cache(s) matching \`${PATTERN:-*}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
