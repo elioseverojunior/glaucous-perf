@@ -15,7 +15,24 @@
 color = true
 experimental = true
 idiomatic_version_file = true
-idiomatic_version_file_enable_tools = []
+# NOT `[]`, which is the value that made the comment above a lie: the empty list
+# opts NO tool into its idiomatic version file, so mise read rust-toolchain.toml
+# for nothing and provisioned no Rust at all. `mise ls --current` listed 27 tools
+# and rust was not among them.
+#
+# What filled the gap was Homebrew's `rustup`, and it stopped filling it: the
+# formula is keg-only and no longer ships `rustup-init`, so its shims stay in
+# $(brew --prefix rustup)/bin, `~/.cargo/bin` never gets a `cargo` shim, and
+# every `cargo:` tool in [tools] below fails to install with
+# `~/.cargo/bin/cargo-binstall failed` -- cargo-binstall is on PATH, `cargo` is
+# not. Naming `rust` here makes mise own the toolchain, so a clone plus
+# `mise run setup` is sufficient and no shell rc has to be edited.
+#
+# The VERSION still lives in rust-toolchain.toml alone. mise reads that file
+# rather than a version repeated in [tools], which is the whole point of the
+# setting -- and its rustup_home/cargo_home default to ~/.rustup and ~/.cargo,
+# so this drives the SAME rustup the toolchains are already installed under.
+idiomatic_version_file_enable_tools = ["rust"]
 legacy_version_file = false
 lockfile = true
 not_found_auto_install = true
