@@ -58,3 +58,16 @@ paths:
       # Ignore the specific error from shellcheck
       - 'shellcheck reported issue in this script: SC2086:.+'
       - 'shellcheck reported issue in this script: SC2129:.+'
+
+  # The ARCHIVE, not a running workflow: nothing under disabled/ is dispatched
+  # or triggered, and GitHub does not read the directory at all. Its cicd.yml
+  # still calls `./.github/workflows/{codeql,publish}.yml`, which 81218b3
+  # deleted -- so actionlint reports two unreadable reusable workflows, fails,
+  # and every hk step after it aborts. Silencing the reference check HERE keeps
+  # the archive readable without pretending those files exist; every other
+  # check, including the expression and shellcheck passes, still runs on it.
+  #
+  # Delete this block if disabled/ is ever deleted or its callees restored.
+  .github/workflows/disabled/**/*.{yml,yaml}:
+    ignore:
+      - 'could not read reusable workflow file for ".+"'
