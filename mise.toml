@@ -15,23 +15,6 @@
 color = true
 experimental = true
 idiomatic_version_file = true
-# NOT `[]`, which is the value that made the comment above a lie: the empty list
-# opts NO tool into its idiomatic version file, so mise read rust-toolchain.toml
-# for nothing and provisioned no Rust at all. `mise ls --current` listed 27 tools
-# and rust was not among them.
-#
-# What filled the gap was Homebrew's `rustup`, and it stopped filling it: the
-# formula is keg-only and no longer ships `rustup-init`, so its shims stay in
-# $(brew --prefix rustup)/bin, `~/.cargo/bin` never gets a `cargo` shim, and
-# every `cargo:` tool in [tools] below fails to install with
-# `~/.cargo/bin/cargo-binstall failed` -- cargo-binstall is on PATH, `cargo` is
-# not. Naming `rust` here makes mise own the toolchain, so a clone plus
-# `mise run setup` is sufficient and no shell rc has to be edited.
-#
-# The VERSION still lives in rust-toolchain.toml alone. mise reads that file
-# rather than a version repeated in [tools], which is the whole point of the
-# setting -- and its rustup_home/cargo_home default to ~/.rustup and ~/.cargo,
-# so this drives the SAME rustup the toolchains are already installed under.
 idiomatic_version_file_enable_tools = ["rust"]
 legacy_version_file = false
 lockfile = true
@@ -331,7 +314,6 @@ alias = []
 description = "Run all local development tasks"
 hide = true
 run = '''
-mise lock
 mise run ci:fix
 mise run build:install
 mise run git:amend:push:force
@@ -589,13 +571,6 @@ BREW_TOOLS="git-cliff gitleaks gh jq rustup scorecard uv yq"
 
 root="$(git rev-parse --show-toplevel)"
 local_cfg="$root/mise.local.toml"
-
-# An empty MISE_DISABLE_TOOLS overrides whatever mise.local.toml sets, so the
-# lockfile is always written from the FULL toolset. A disabled tool is omitted
-# from mise.lock entirely, and a brew machine committing such a lockfile would
-# leave non-brew machines unresolvable. This is why locking no longer needs to
-# delete the local config first.
-MISE_DISABLE_TOOLS= mise lock
 
 have_brew=no
 if [ "$(uname -s)" = "Darwin" ] && command -v brew >/dev/null 2>&1; then
