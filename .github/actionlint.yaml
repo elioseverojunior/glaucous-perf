@@ -38,6 +38,15 @@ config-variables:
   - CRATES_NAME
   - GITVERSION_SPEC
   - UPLOAD_ARTIFACTS
+  # performance.yml's platform table. Each names the runner label that measures
+  # one architecture, so a repo with self-hosted metal can move a benchmark off
+  # a shared VM -- the only way a run earns `quality: ok` -- without editing the
+  # workflow. Unset everywhere, which is what makes the GitHub-hosted defaults
+  # in the table apply.
+  - PERF_RUNNER_LINUX_X86_64
+  - PERF_RUNNER_LINUX_AARCH64
+  - PERF_RUNNER_MACOS_X86_64
+  - PERF_RUNNER_MACOS_AARCH64
 
 # Path-specific configurations.
 paths:

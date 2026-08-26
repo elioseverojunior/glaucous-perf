@@ -4,16 +4,24 @@
 
 name: Performance
 
-# Per-change benchmark gate. Compares the PR/commit against the baseline
-# stored on the `gh-pages` branch and fails the run on a measurable
-# regression. The baseline is only updated by pushes to `main`.
+# Multi-architecture benchmark run. `perf-matrix` expands one platform table
+# into a job per NATIVE host -- Linux x86_64/aarch64 and macOS x86_64/aarch64 --
+# each measuring the Criterion suite where it actually runs, and `perf-report`
+# pivots the four result sets into one table.
+#
+# It MEASURES; it does not gate. The per-change regression gate against the
+# `gh-pages` baseline is described at the bottom of this file and is not wired
+# up: benchmark numbers from shared CI runners move by tens of percent between
+# runs, which fails pull requests on phantom regressions. Every figure this
+# workflow publishes from a GitHub-hosted runner is marked `degraded` for the
+# same reason -- read ratios within a column, never absolute times across them.
 #
 # Security note: this workflow does not interpolate any user-controlled
 # content (issue/PR titles, commit messages, head_ref, etc.) into `run:`
 # steps. All `${{ }}` usages are either repo metadata in action inputs
-# or conditional gates.
+# or conditional gates; dispatch inputs reach a shell only through `env:`.
 #
-# First-time setup (one-off):
+# gh-pages setup, needed ONLY if the baseline gate at the bottom is restored:
 #   1. Create an empty `gh-pages` branch:
 #        git checkout --orphan gh-pages && git rm -rf . && \
 #        git commit --allow-empty -m "init gh-pages" && \
@@ -52,7 +60,44 @@ on:
   #     - "Cargo.toml"
   #     - "Cargo.lock"
   #     - ".github/workflows/performance.yml"
+  # The matrix is chosen HERE, at dispatch time, not hardcoded in the job. A
+  # benchmark run is expensive -- the full suite is ~85 minutes per host, and
+  # macOS minutes bill at 10x Linux -- so "measure everything" has to be a
+  # deliberate choice rather than the only option. Every input has a default
+  # that makes a bare `gh workflow run performance.yml` do the full sweep.
   workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Hosts to measure on"
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - macos
+          - linux-x86_64
+          - linux-aarch64
+          - macos-x86_64
+          - macos-aarch64
+      toolchain:
+        description: "Toolchain: `default` reads rust-toolchain.toml"
+        type: choice
+        default: default
+        options:
+          - default
+          - stable
+          - nightly
+      mode:
+        description: "`quick` trades Criterion's precision for wall-clock"
+        type: choice
+        default: full
+        options:
+          - full
+          - quick
+      bench:
+        description: "One bench target, e.g. `scanner`; empty runs all seven"
+        type: string
+        default: ""
 
 # Read-only at workflow scope. Every write this workflow needs is declared on
 # the single job that performs it, below.
@@ -128,7 +173,102 @@ jobs:
     uses: ./.github/workflows/version.yml
 
   # ──────────────────────────────────────────────
-  #  3.  Lint — HK project lints
+  #  3.  Perf matrix — ONE platform table, expanded at dispatch time
+  # ──────────────────────────────────────────────
+  # The generator. It exists because `runs-on` is the ONLY thing that decides
+  # which architecture a job measures: a matrix that crosses `os: [ubuntu-latest,
+  # macos-15]` with `arch: [x86_64, aarch64]` produces four jobs on TWO distinct
+  # machines -- the `aarch64` half lands on the same x86_64 runner as its sibling
+  # and reports x86_64 timings under an aarch64 label. Cross-compiling does not
+  # rescue it either: a benchmark has to RUN, and an aarch64 binary does not run
+  # on an x86_64 host. So arch is not a dimension here; it is a property of the
+  # runner label, and this table is the mapping.
+  #
+  # Native runner labels (verified 2026-08-26):
+  #   ubuntu-24.04       Linux x86_64
+  #   ubuntu-24.04-arm   Linux aarch64  (GA; free for public repos)
+  #   macos-15-intel     macOS x86_64   (the LAST Intel image -- available until
+  #                                      August 2027, after which GitHub hosts no
+  #                                      x86_64 macOS at all)
+  #   macos-15           macOS aarch64  (Apple silicon)
+  #
+  # Every label is overridable through a repo variable, which is the point of
+  # keeping them in data rather than in `runs-on`. Benchmarks on shared runners
+  # are noisy enough that the numbers carry a `degraded` marker (see the
+  # preflight step below); pointing PERF_RUNNER_* at self-hosted metal is how a
+  # run becomes decision-grade without editing this file.
+  perf-matrix:
+    name: Perf Matrix
+    # A ROOT job. It expands a table with jq -- no checkout, no toolchain, no
+    # dependency on `setup`, whose cache is keyed to ONE host and therefore has
+    # nothing to offer four different ones.
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.expand.outputs.include }}
+      count: ${{ steps.expand.outputs.count }}
+    steps:
+      - name: Expand the platform table
+        id: expand
+        # Through the environment rather than `${{ }}` inside the script body:
+        # `platforms` is a dispatch input, and interpolating one straight into a
+        # shell is the injection shape the header note above forbids. `choice`
+        # inputs constrain the value, but the rule does not bend for the inputs
+        # that happen to be safe today.
+        env:
+          SELECT: ${{ inputs.platforms || 'all' }}
+          CHANNEL: ${{ inputs.toolchain || 'default' }}
+          RUNNER_LINUX_X86_64: ${{ vars.PERF_RUNNER_LINUX_X86_64 || 'ubuntu-24.04' }}
+          RUNNER_LINUX_AARCH64: ${{ vars.PERF_RUNNER_LINUX_AARCH64 || 'ubuntu-24.04-arm' }}
+          RUNNER_MACOS_X86_64: ${{ vars.PERF_RUNNER_MACOS_X86_64 || 'macos-15-intel' }}
+          RUNNER_MACOS_AARCH64: ${{ vars.PERF_RUNNER_MACOS_AARCH64 || 'macos-15' }}
+        run: |
+          set -Eeuo pipefail
+
+          include="$(
+            jq -nc \
+              --arg select "${SELECT}" \
+              --arg channel "${CHANNEL}" \
+              --arg linux_x86_64 "${RUNNER_LINUX_X86_64}" \
+              --arg linux_aarch64 "${RUNNER_LINUX_AARCH64}" \
+              --arg macos_x86_64 "${RUNNER_MACOS_X86_64}" \
+              --arg macos_aarch64 "${RUNNER_MACOS_AARCH64}" '
+                [
+                  {key: "linux-x86_64",  label: "Linux x86_64",  os: "linux", arch: "x86_64",  runner: $linux_x86_64,  target: "x86_64-unknown-linux-gnu"},
+                  {key: "linux-aarch64", label: "Linux aarch64", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"},
+                  {key: "macos-x86_64",  label: "macOS x86_64",  os: "macos", arch: "x86_64",  runner: $macos_x86_64,  target: "x86_64-apple-darwin"},
+                  {key: "macos-aarch64", label: "macOS aarch64", os: "macos", arch: "aarch64", runner: $macos_aarch64, target: "aarch64-apple-darwin"}
+                ]
+                | map(select($select == "all" or .os == $select or .key == $select))
+                | map(. + {
+                    channel: $channel,
+                    # setup-rust-env reads rust-toolchain.toml when this is
+                    # empty, which is what keeps that file the single source of
+                    # truth for the default run.
+                    toolchain: (if $channel == "default" then "" else $channel end)
+                  })
+              '
+          )"
+
+          count="$(jq 'length' <<<"${include}")"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::no platform matches '${SELECT}'; nothing to measure"
+            exit 1
+          fi
+
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Performance matrix"
+            echo
+            echo "| Platform | Runner | Target | Toolchain |"
+            echo "|:--|:--|:--|:--|"
+            jq -r '.[] | "| \(.label) | `\(.runner)` | `\(.target)` | \(.channel) |"' <<<"${include}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ──────────────────────────────────────────────
+  #  4.  Lint — HK project lints
   # ──────────────────────────────────────────────
   lint:
     name: Lint
@@ -313,153 +453,318 @@ jobs:
           # dependency raise the real MSRV without ever failing here.
           cargo check --locked --all-features "${packages[@]}"
 
-  # benchmark:
-  #   name: Bench vs main baseline
-  #   runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
-  #   # Moved here from workflow scope. A job block REPLACES the workflow default
-  #   # rather than merging with it, so this must restate every scope the job
-  #   # needs, `contents` included -- listing only the writes would silently drop
-  #   # read access.
-  #   permissions:
-  #     contents: write # push the updated baseline to gh-pages
-  #     pull-requests: write # post the comparison comment on PRs
-  #     deployments: write # required by benchmark-action for environments
-  #   timeout-minutes: 45
+  # ──────────────────────────────────────────────
+  #  6.  Benchmark — one native run per platform
+  # ──────────────────────────────────────────────
+  benchmark:
+    name: Bench (${{ matrix.label }})
+    needs: [setup, version, perf-matrix]
+    runs-on: ${{ matrix.runner }}
+    # The full suite is ~85 minutes on a healthy host and the slowest platform
+    # sets this, not the fastest.
+    timeout-minutes: 150
+    strategy:
+      # A dead runner label or an OOM on one platform must not cancel the three
+      # that are measuring fine -- partial results are still results, and
+      # `perf-report` renders whatever arrives.
+      fail-fast: false
+      matrix:
+        # No base keys: `include` alone expands to exactly the entries the
+        # generator emitted, one job each.
+        include: ${{ fromJSON(needs.perf-matrix.outputs.include) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No submodules and no history. The only submodule is the yaml-test-
+          # suite conformance corpus, which nothing under crates/glaucus-bench
+          # reads -- every fixture there is generated in code -- and cloning it
+          # on four runners buys nothing. bench-to-json.py's `git rev-parse`
+          # calls are satisfied by a depth-1 checkout.
+          fetch-depth: 1
+          ref: ${{ env.REF }}
 
-  #   steps:
-  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-  #       with:
-  #         submodules: recursive
-  #         fetch-depth: 0
+      - name: Setup Environment
+        uses: ./.github/actions/setup-rust-env
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          # Namespaced per platform AND per channel: these caches key on the
+          # dependency set and the toolchain, and four hosts sharing one
+          # namespace would otherwise trade artifacts they cannot use.
+          cache-key-suffix: perf-${{ matrix.key }}-${{ matrix.channel }}
 
-  #     - name: Setup Environment
-  #       uses: ./.github/actions/setup-rust-env
+      # The guard that makes the matrix mean what it says. If a runner label
+      # ever moves -- GitHub retires an image, someone repoints a PERF_RUNNER_*
+      # variable at the wrong metal -- the run would otherwise publish timings
+      # from one architecture under another one's name, which is worse than no
+      # measurement at all.
+      - name: Assert the host is the architecture it claims to be
+        env:
+          EXPECTED: ${{ matrix.target }}
+        run: |
+          set -Eeuo pipefail
+          host="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "rustc host triple: ${host}"
+          if [ "${host}" != "${EXPECTED}" ]; then
+            echo "::error::runner is ${host}, but the matrix entry declares ${EXPECTED}."
+            echo "::error::Benchmarks must run NATIVELY; a cross-compiled binary cannot execute here."
+            exit 1
+          fi
 
-  #     - name: Print runner profile
-  #       run: |
-  #         echo "::group::Runner profile"
-  #         echo "CPUs: $(nproc)"
-  #         echo "Mem:  $(free -h | awk '/Mem:/ {print $2}')"
-  #         uname -a
-  #         rustc --version
-  #         echo "::endgroup::"
+      # .cargo/config.toml pins `linker = "aarch64-linux-gnu-gcc"` for this
+      # triple -- written for CROSS-compiling from x86_64, where that name is
+      # the cross toolchain. On a native arm64 runner the same triple is the
+      # host, and cargo still demands that exact binary name. Debian's multiarch
+      # gcc usually provides it; when it does not, the native compiler IS the
+      # right one and only the name is missing, so a symlink is the whole fix.
+      - name: Provide the linker name .cargo/config.toml expects
+        if: matrix.key == 'linux-aarch64'
+        run: |
+          set -Eeuo pipefail
+          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            echo "aarch64-linux-gnu-gcc already on PATH: $(command -v aarch64-linux-gnu-gcc)"
+            exit 0
+          fi
+          mkdir -p "$HOME/.local/bin"
+          ln -sf "$(command -v gcc)" "$HOME/.local/bin/aarch64-linux-gnu-gcc"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "linked aarch64-linux-gnu-gcc -> $(command -v gcc)"
 
-  #     - name: Reduce CPU frequency variance
-  #       run: |
-  #         sudo cpupower frequency-set --governor performance \
-  #           || echo "cpupower unavailable; continuing with default governor"
+      - name: Print runner profile
+        run: |
+          set -Eeuo pipefail
+          echo "::group::Runner profile"
+          uname -a
+          rustc --version
+          if [ "${RUNNER_OS}" = "Linux" ]; then
+            echo "CPUs: $(nproc)"
+            free -h | awk '/Mem:/ {print "Mem:  " $2}'
+          else
+            echo "CPUs: $(sysctl -n hw.ncpu)"
+            echo "Mem:  $(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 )) GiB"
+            sw_vers
+          fi
+          echo "::endgroup::"
 
-  #     - name: Build benchmarks (warm cache, fail fast on compile errors)
-  #       run: cargo bench -p glaucus-bench --no-run
+      # Linux-only and best-effort: macOS exposes no equivalent knob, and the
+      # governor is not settable on a GitHub-hosted VM at all. It costs seconds
+      # and matters on self-hosted metal.
+      - name: Reduce CPU frequency variance
+        if: runner.os == 'Linux'
+        run: |
+          sudo cpupower frequency-set --governor performance \
+            || echo "cpupower unavailable; continuing with the default governor"
 
-  #     - name: Run benchmarks (bencher output format)
-  #       run: |
-  #         cargo bench -p glaucus-bench -- --output-format bencher \
-  #           | tee bench-output.txt
+      # Records how busy the host was BEFORE the run, which is the only moment
+      # the answer is meaningful. See the script's own header for 2026-08-01,
+      # where 77 internally consistent measurements were 4.6x-20.9x wrong.
+      #
+      # `--report`, so a busy runner marks the data rather than failing the job:
+      # on a shared runner the verdict is `degraded` often enough that a gate
+      # would just be noise, and the marker is what the docs page keys its
+      # warning banner off.
+      - name: Host preflight
+        id: preflight
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/bench-preflight.py --report --snapshot bench-host.json
+          quality="$(python3 -c 'import json,pathlib;print(json.loads(pathlib.Path("bench-host.json").read_text())["quality"])')"
 
-  #     - name: Sanity-check parseable output
-  #       run: |
-  #         if ! grep -q "ns/iter" bench-output.txt; then
-  #           echo "::error::No 'ns/iter' lines found in bench-output.txt."
-  #           echo "Criterion may have failed before producing measurements."
-  #           tail -n 50 bench-output.txt
-  #           exit 1
-  #         fi
-  #         echo "Parsed $(grep -c 'ns/iter' bench-output.txt) benchmark measurements."
+          # A GitHub-hosted runner is a shared VM whose wall-clock timings vary
+          # by tens of percent between runs. A quiet load average says the
+          # measurement was not contaminated by a NEIGHBOURING PROCESS; it says
+          # nothing about the hypervisor. Only a host we control can claim `ok`.
+          if [ "${RUNNER_ENVIRONMENT}" != "self-hosted" ]; then
+            quality="degraded"
+            echo "github-hosted runner: forcing quality=degraded"
+          fi
+          echo "quality=${quality}" >> "$GITHUB_OUTPUT"
 
-  #     - name: Compare against baseline
-  #       uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
-  #       with:
-  #         name: Glaucus benchmarks
-  #         tool: cargo
-  #         output-file-path: bench-output.txt
-  #         github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build benchmarks (warm cache, fail fast on compile errors)
+        run: cargo bench --locked -p glaucus-bench --no-run
 
-  #         gh-pages-branch: gh-pages
-  #         # NOT `benchmarks`: gh-pages.yml publishes the VitePress site to the
-  #         # root of this same branch, and the site already emits
-  #         # benchmarks/baseline.html and benchmarks/latest.html. Sharing the
-  #         # directory means the action's index.html and the site's pages compete
-  #         # for the same paths -- today only `keep_files: true` on the docs
-  #         # deploy stops data.js being swept away. Separate directory, no race.
-  #         benchmark-data-dir-path: bench-data
+      - name: Run benchmarks
+        env:
+          BENCH: ${{ inputs.bench }}
+          MODE: ${{ inputs.mode || 'full' }}
+        run: |
+          set -Eeuo pipefail
+          cargo_args=(--locked -p glaucus-bench)
+          if [ -n "${BENCH}" ]; then
+            cargo_args+=(--bench "${BENCH}")
+          fi
+          # `--output-format bencher` is what bench-to-json.py and the
+          # benchmark-action baseline both parse; `--quick` drops Criterion's
+          # sample count for a fast smoke run and is NOT decision-grade.
+          criterion_args=(--output-format bencher)
+          if [ "${MODE}" = "quick" ]; then
+            criterion_args+=(--quick)
+          fi
+          cargo bench "${cargo_args[@]}" -- "${criterion_args[@]}" | tee bench-output.txt
 
-  #         # Gated on the branch alone, NOT on `github.event_name == 'push'`.
-  #         # The push trigger above is commented out, so event_name is always
-  #         # `workflow_dispatch` and both flags were permanently false: the
-  #         # baseline could never be written and every run compared against
-  #         # nothing. Re-enabling `push:` would restore the old meaning; until
-  #         # then a dispatch from main is what establishes the baseline.
-  #         auto-push: ${{ github.ref == 'refs/heads/main' }}
-  #         save-data-file: ${{ github.ref == 'refs/heads/main' }}
+      - name: Sanity-check parseable output
+        run: |
+          set -Eeuo pipefail
+          if ! grep -q "ns/iter" bench-output.txt; then
+            echo "::error::No 'ns/iter' lines in bench-output.txt."
+            echo "Criterion may have failed before producing measurements."
+            tail -n 50 bench-output.txt
+            exit 1
+          fi
+          echo "Parsed $(grep -c 'ns/iter' bench-output.txt) benchmark measurements."
 
-  #         # Regression gate thresholds (ratio of current/baseline).
-  #         #   150% -> 50% slower than baseline triggers a warning comment.
-  #         #   200% -> 100% slower fails the job.
-  #         alert-threshold: "150%"
-  #         fail-threshold: "200%"
-  #         fail-on-alert: true
+      # One file per platform, named by the matrix key, so `perf-report` can
+      # download every artifact into a single directory without collisions.
+      - name: Render benchmark JSON
+        env:
+          KEY: ${{ matrix.key }}
+          RUNNER_LABEL: ${{ matrix.label }}
+          RUNNER_NAME: ${{ matrix.runner }}
+          QUALITY: ${{ steps.preflight.outputs.quality }}
+        run: |
+          set -Eeuo pipefail
+          python3 scripts/bench-to-json.py bench-output.txt \
+            -o "perf-out/${KEY}.json" \
+            --quality "${QUALITY}" \
+            --runner "${RUNNER_LABEL}" \
+            --note "Measured on ${RUNNER_NAME}. Ratios between libraries are the figures worth reading; absolute times are comparable only within this one platform's column."
 
-  #         summary-always: true
-  #         comment-on-alert: true
-  #         alert-comment-cc-users: "@${{ github.repository_owner }}"
+      - name: Upload benchmark JSON
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-json-${{ matrix.key }}
+          path: perf-out/
+          retention-days: 90
+          if-no-files-found: warn
 
-  #     # Feeds docs/benchmarks/latest.md through the VitePress data loader at
-  #     # docs/benchmarks/results.data.ts. `--quality degraded` is the default for
-  #     # GitHub-hosted runners on purpose: they are shared VMs whose wall-clock
-  #     # timings vary by tens of percent, and a run can look internally healthy
-  #     # (tight intervals) while being badly wrong in absolute terms. The page
-  #     # renders a warning banner off that field. Pass `ok` only from a runner
-  #     # you control and know to be quiet.
-  #     - name: Render benchmark JSON for the docs site
-  #       if: always()
-  #       env:
-  #         RUNNER_LABEL: ${{ runner.os }} / ${{ vars.RUNS_ON || 'ubuntu-latest' }}
-  #       run: |
-  #         set -Eeuo pipefail
-  #         python3 scripts/bench-to-json.py bench-output.txt \
-  #           -o docs/.data/benchmarks.json \
-  #           --quality degraded \
-  #           --runner "${RUNNER_LABEL}" \
-  #           --note "Measured on a shared GitHub-hosted runner. Ratios between libraries are the figures worth reading; absolute times vary between runs and are not comparable with the curated baseline."
+      - name: Upload bencher-format measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bench-output-${{ matrix.key }}-${{ github.run_id }}
+          path: |
+            bench-output.txt
+            bench-host.json
+          retention-days: 90
+          if-no-files-found: warn
 
-  #     # A pull request, never a push to main. Benchmark numbers from shared
-  #     # runners need a human to look at them before they become the published
-  #     # record -- exactly the review that would have caught the 2026-08-01 run,
-  #     # which was internally consistent and still 4.6x-20.9x wrong. This also
-  #     # keeps the docs deploy triggered by a normal merge rather than by a bot
-  #     # commit that bypasses branch protection.
-  #     - name: Open a PR with the refreshed benchmark data
-  #       if: github.ref == 'refs/heads/main'
-  #       uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
-  #       with:
-  #         token: ${{ secrets.GITHUB_TOKEN }}
-  #         add-paths: docs/.data/benchmarks.json
-  #         branch: bot/benchmark-data
-  #         delete-branch: true
-  #         commit-message: "docs(bench): refresh benchmark data from CI run"
-  #         title: "docs(bench): refresh benchmark data"
-  #         body: |
-  #           Automated refresh of `docs/.data/benchmarks.json` from the
-  #           Performance workflow. Rendered by `docs/benchmarks/latest.md`.
+      - name: Upload Criterion HTML reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: criterion-reports-${{ matrix.key }}-${{ github.run_id }}
+          path: target/criterion/
+          retention-days: 30
+          if-no-files-found: warn
 
-  #           Measured on a shared GitHub-hosted runner, so the run is marked
-  #           `degraded`: read the ratios, not the absolute times, and do not copy
-  #           these figures into `docs/benchmarks/baseline.md`.
+  # ──────────────────────────────────────────────
+  #  7.  Perf report — the cross-platform pivot
+  # ──────────────────────────────────────────────
+  # Without this the matrix leaves four artifacts and no comparison, which is
+  # the one thing a multi-arch run exists to produce.
+  #
+  # Read the table DOWN a column, not across a row: absolute times from four
+  # different machines (and two of them shared VMs) are not comparable with each
+  # other. What a row does show is a benchmark that behaves structurally
+  # differently on one architecture -- an aarch64 column that is 5x its
+  # neighbours where every other row is 1.2x is a real signal.
+  perf-report:
+    name: Perf Report
+    needs: [perf-matrix, benchmark]
+    # `always()`, so three good platforms still report when a fourth dies; the
+    # failed `benchmark` job keeps the run red on its own.
+    if: always() && needs.benchmark.result != 'skipped'
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    steps:
+      - name: Download every platform's JSON
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: perf-json-*
+          merge-multiple: true
+          path: perf-out
 
-  #     - name: Upload Criterion HTML reports
-  #       if: always()
-  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-  #       with:
-  #         name: criterion-reports-${{ github.run_id }}
-  #         path: target/criterion/
-  #         retention-days: 30
-  #         if-no-files-found: warn
+      - name: Build the cross-platform summary
+        run: |
+          set -Eeuo pipefail
+          shopt -s nullglob
+          files=(perf-out/*.json)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::warning::no benchmark JSON was produced; nothing to report"
+            exit 0
+          fi
+          echo "Merging ${#files[@]} platform result files."
 
-  #     - name: Upload bencher-format measurements
-  #       if: always()
-  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-  #       with:
-  #         name: bench-output-${{ github.run_id }}
-  #         path: bench-output.txt
-  #         retention-days: 90
+          cat > pivot.jq <<'JQ'
+          def us: (. / 1000 * 100 | round / 100 | tostring) + " µs";
+
+          (map(.runner) | unique) as $cols
+          | ([ .[] | .runner as $r | .measurements[] | {id, group, r: $r, ns: .ns_per_iter} ]
+             | group_by(.id) | sort_by(.[0].group, .[0].id)) as $rows
+          | [ "| Benchmark | " + ($cols | join(" | ")) + " |",
+              "|:--|" + ($cols | map("--:") | join("|")) + "|" ]
+            + [ $rows[]
+                | . as $g
+                | "| `" + $g[0].id + "` | "
+                  + ( $cols
+                      | map( . as $c | (($g[] | select(.r == $c) | .ns) // null)
+                             | if . == null then "—" else us end )
+                      | join(" | ") )
+                  + " |" ]
+          | .[]
+          JQ
+
+          {
+            echo "### Cross-platform benchmark results"
+            echo
+            echo "| Platform | Toolchain | Quality | Measurements |"
+            echo "|:--|:--|:--|--:|"
+            jq -sr '.[] | "| \(.runner) | \(.toolchain) | \(.quality) | \(.measurements | length) |"' "${files[@]}"
+            echo
+            jq -sr -f pivot.jq "${files[@]}"
+            echo
+            echo "> Compare DOWN a column. Absolute times from different hosts are not"
+            echo "> comparable, and every \`degraded\` row was measured on a shared VM."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # One artifact carrying every platform, for anyone who wants to diff
+          # two runs without downloading four files.
+          jq -s --arg run "${GITHUB_RUN_ID}" --arg sha "${GITHUB_SHA}" \
+            '{run_id: $run, commit: $sha, platforms: .}' \
+            "${files[@]}" > perf-combined.json
+
+      - name: Upload the combined result
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: perf-combined-${{ github.run_id }}
+          path: perf-combined.json
+          retention-days: 90
+          if-no-files-found: warn
+
+  # ──────────────────────────────────────────────
+  #  The gh-pages baseline gate — deliberately NOT wired up
+  # ──────────────────────────────────────────────
+  # benchmark-action/github-action-benchmark used to run here as a single-host
+  # regression gate (`alert-threshold: 150%`, `fail-threshold: 200%`), pushing
+  # its history to `bench-data/` on gh-pages. Restoring it under a MATRIX needs
+  # three changes, none of them cosmetic:
+  #
+  #   1. Per-platform storage. One `benchmark-data-dir-path` shared by four
+  #      hosts interleaves incomparable series into one chart and alerts on the
+  #      difference between machines. It has to become `bench-data/<matrix.key>`,
+  #      with `name` carrying the platform too.
+  #   2. Serialised pushes. Four jobs committing to gh-pages concurrently race;
+  #      the loser's history is lost or the push fails outright. Either set
+  #      `max-parallel: 1` on the matrix, or move the compare into `perf-report`
+  #      and loop over the downloaded artifacts.
+  #   3. `permissions: contents: write` on whichever job pushes -- which is why
+  #      it is absent today. Every job in this file is read-only, and a write
+  #      grant that exists for a disabled step is exactly the silent privilege
+  #      this file's header note is about.
+  #
+  # Also unresolved: docs/benchmarks/results.data.ts reads ONE
+  # docs/.data/benchmarks.json, so publishing four platforms means teaching the
+  # loader about the platform dimension first. Until then `perf-combined.json`
+  # from `perf-report` is the artifact to read.
