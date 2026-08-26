@@ -234,10 +234,10 @@ jobs:
               --arg macos_x86_64 "${RUNNER_MACOS_X86_64}" \
               --arg macos_aarch64 "${RUNNER_MACOS_AARCH64}" '
                 [
-                  {key: "linux-x86_64",  label: "Linux x86_64",  os: "linux", arch: "x86_64",  runner: $linux_x86_64,  target: "x86_64-unknown-linux-gnu"},
-                  {key: "linux-aarch64", label: "Linux aarch64", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"},
-                  {key: "macos-x86_64",  label: "macOS x86_64",  os: "macos", arch: "x86_64",  runner: $macos_x86_64,  target: "x86_64-apple-darwin"},
-                  {key: "macos-aarch64", label: "macOS aarch64", os: "macos", arch: "aarch64", runner: $macos_aarch64, target: "aarch64-apple-darwin"}
+                  {key: "linux-24.04-x86_64",  label: "ubuntu-24.04",  os: "linux", arch: "x86_64",  runner: $linux_x86_64,  target: "x86_64-unknown-linux-gnu"},
+                  {key: "linux-24.04-aarch64", label: "ubuntu-24.04-arm", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"},
+                  {key: "macos-26-x86_64",  label: "macos-26-intel",  os: "macos", arch: "x86_64",  runner: $macos_x86_64,  target: "x86_64-apple-darwin"},
+                  {key: "macos-26-aarch64", label: "macos-26", os: "macos", arch: "aarch64", runner: $macos_aarch64, target: "aarch64-apple-darwin"}
                 ]
                 | map(select($select == "all" or .os == $select or .key == $select))
                 | map(. + {
