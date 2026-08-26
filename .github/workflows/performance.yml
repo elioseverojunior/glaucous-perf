@@ -24,6 +24,10 @@ name: Performance
 #      ensure "Read and write permissions" is enabled (required for the
 #      action to push the updated baseline).
 
+concurrency:
+  group: perf-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   # Auto-triggers disabled: the benchmark gate is flaky on shared CI runners
   # (noisy neighbours skew timings and fail PRs on phantom regressions). Run it
@@ -61,162 +65,401 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: perf-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
+  # `mise run` installs [tools] before every task, which overrides mise-action's
+  # `install: false`: the Supply Chain job spent 8m57s having `mise run comply`
+  # build all 26 pinned tools from source, because mise looks for cargo-binstall
+  # at ~/.cargo/bin and CI has none, so its cargo backend compiles instead. The
+  # gates below use mise for its config flags, not for provisioning --
+  # setup-rust-env has already put every tool they need on PATH as a prebuilt
+  # binary.
+  MISE_TASK_RUN_AUTO_INSTALL: false
+  # mise.toml's [env] does `GITHUB_TOKEN = {{env.GITHUB_TOKEN | default(value='')}}`,
+  # so with nothing set it exports an EMPTY token -- worse than unset, since any
+  # tool that reads it then makes unauthenticated, rate-limited API calls.
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || github.token }}
+  GITVERSION_SPEC: ${{ vars.GITVERSION_SPEC || '6.x' }}
   CRITERION_HOME: ${{ github.workspace }}/target/criterion
+  REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
 
 jobs:
-  benchmark:
-    name: Bench vs main baseline
+  # ──────────────────────────────────────────────
+  #  1.  Setup — shared bootstrap for all jobs
+  # ──────────────────────────────────────────────
+  setup:
+    name: Setup
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    # Moved here from workflow scope. A job block REPLACES the workflow default
-    # rather than merging with it, so this must restate every scope the job
-    # needs, `contents` included -- listing only the writes would silently drop
-    # read access.
-    permissions:
-      contents: write # push the updated baseline to gh-pages
-      pull-requests: write # post the comparison comment on PRs
-      deployments: write # required by benchmark-action for environments
-    timeout-minutes: 45
-
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          submodules: "recursive"
           fetch-depth: 0
+          fetch-tags: "true"
+          ref: ${{ env.REF }}
 
       - name: Setup Environment
         uses: ./.github/actions/setup-rust-env
 
-      - name: Print runner profile
-        run: |
-          echo "::group::Runner profile"
-          echo "CPUs: $(nproc)"
-          echo "Mem:  $(free -h | awk '/Mem:/ {print $2}')"
-          uname -a
-          rustc --version
-          echo "::endgroup::"
+  # ──────────────────────────────────────────────
+  #  2.  Version - shared GitVersion SemVer
+  # ──────────────────────────────────────────────
+  # GitVersion runs HERE and nowhere else in this workflow. It used to be three
+  # steps inside `release` -- cache, setup, execute -- which meant the tool was
+  # provisioned and the version recomputed inside a job that also tags, pushes
+  # and publishes. version.yml owns that now, so there is one definition of what
+  # the version is and one place that derives `majorMinor`, which the action
+  # itself does not publish.
+  #
+  # A ROOT job -- no `needs`, no `if:`. It derives the version from tags and
+  # commit distance, so it wants the checkout and nothing else; waiting on `build`
+  # would serialise it behind the whole test-and-build chain for no reason.
+  #
+  # The absence of an `if:` is load-bearing, not an oversight. `build` depends on
+  # this job and `build` runs on pull requests, and GitHub skips the dependents of
+  # a skipped job -- so gating this on `push` to the default branch would skip
+  # `build` on every pull request. A job that only `release` consumed could be
+  # conditional; one that `build` consumes cannot.
+  version:
+    name: Version
+    permissions:
+      contents: read
+    uses: ./.github/workflows/version.yml
 
-      - name: Reduce CPU frequency variance
-        run: |
-          sudo cpupower frequency-set --governor performance \
-            || echo "cpupower unavailable; continuing with default governor"
+  # ──────────────────────────────────────────────
+  #  3.  Lint — HK project lints
+  # ──────────────────────────────────────────────
+  lint:
+    name: Lint
+    # `setup` and `version` are the two roots and run in parallel; everything
+    # downstream gates on both. Naming `version` in this first tier is what makes
+    # a version failure stop the run here rather than surfacing 20 minutes later
+    # in `build` -- and `tests` inherits the dependency transitively, so it does
+    # not need repeating there.
+    needs: [setup, version]
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+          fetch-tags: "true"
+          ref: ${{ env.REF }}
 
-      - name: Build benchmarks (warm cache, fail fast on compile errors)
-        run: cargo bench -p glaucus-bench --no-run
+      - name: Setup Environment
+        uses: ./.github/actions/setup-rust-env
 
-      - name: Run benchmarks (bencher output format)
-        run: |
-          cargo bench -p glaucus-bench -- --output-format bencher \
-            | tee bench-output.txt
+      - name: Run HK Lints
+        run: hk check --all
 
-      - name: Sanity-check parseable output
+  # ──────────────────────────────────────────────
+  #  5.  MSRV — compile at the DECLARED minimum
+  # ──────────────────────────────────────────────
+  # The job that keeps `rust-version` honest. Without it an MSRV is a claim, not
+  # a constraint: every other job here builds with rust-toolchain.toml's pin, so
+  # the declared floor can only ever drift UPWARD, and always silently -- the
+  # pinned toolchain never disagrees with it. That is exactly how the workspace
+  # came to advertise 1.97 while the code still compiled on 1.88, making every
+  # routine toolchain bump an invisible breaking change for consumers (issue #3).
+  msrv:
+    name: MSRV
+    # First tier, alongside `lint`/`sast`, rather than downstream of them: this
+    # is one `cargo check`, and a broken floor should surface in three minutes
+    # instead of behind the full test-and-build chain.
+    needs: [setup, version]
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+          fetch-tags: "true"
+          ref: ${{ env.REF }}
+
+      # READ the floor; never hardcode it. A literal version here would be a
+      # second source of truth free to disagree with Cargo.toml -- the same class
+      # of bug this job exists to catch, just relocated into the workflow.
+      - name: Read declared MSRV from Cargo.toml
+        id: msrv
         run: |
-          if ! grep -q "ns/iter" bench-output.txt; then
-            echo "::error::No 'ns/iter' lines found in bench-output.txt."
-            echo "Criterion may have failed before producing measurements."
-            tail -n 50 bench-output.txt
+          set -euo pipefail
+          version="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+          if [ -z "$version" ]; then
+            echo "::error file=Cargo.toml::no rust-version found in [workspace.package]"
             exit 1
           fi
-          echo "Parsed $(grep -c 'ns/iter' bench-output.txt) benchmark measurements."
 
-      - name: Compare against baseline
-        uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
-        with:
-          name: Glaucus benchmarks
-          tool: cargo
-          output-file-path: bench-output.txt
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Two files declare the floor to two different tools, and they have to
+          # agree. Cargo.toml's `rust-version` is the promise to consumers and
+          # what this job compiles against; .clippy.toml's `msrv` is what makes
+          # clippy REJECT an API newer than the floor even though the pinned
+          # toolchain offers it -- a check that catches at lint time what this
+          # job only catches once the code is written.
+          #
+          # Nothing else compares them. Left unchecked, .clippy.toml silently
+          # keeps linting against a floor the project abandoned, which is the
+          # exact defect this job exists to prevent, one file over. A missing
+          # `msrv` is failed too, not tolerated: dropping the key would quietly
+          # switch clippy back to assuming the pinned toolchain.
+          clippy_msrv="$(sed -n 's/^msrv[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .clippy.toml | head -n1)"
+          if [ -z "$clippy_msrv" ]; then
+            echo "::error file=.clippy.toml::no msrv key; it must declare msrv = \"${version}\" to match Cargo.toml"
+            exit 1
+          fi
+          if [ "$clippy_msrv" != "$version" ]; then
+            echo "::error file=.clippy.toml::msrv \"${clippy_msrv}\" disagrees with Cargo.toml rust-version \"${version}\""
+            exit 1
+          fi
 
-          gh-pages-branch: gh-pages
-          # NOT `benchmarks`: gh-pages.yml publishes the VitePress site to the
-          # root of this same branch, and the site already emits
-          # benchmarks/baseline.html and benchmarks/latest.html. Sharing the
-          # directory means the action's index.html and the site's pages compete
-          # for the same paths -- today only `keep_files: true` on the docs
-          # deploy stops data.js being swept away. Separate directory, no race.
-          benchmark-data-dir-path: bench-data
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Declared MSRV: ${version} (Cargo.toml and .clippy.toml agree)"
 
-          # Gated on the branch alone, NOT on `github.event_name == 'push'`.
-          # The push trigger above is commented out, so event_name is always
-          # `workflow_dispatch` and both flags were permanently false: the
-          # baseline could never be written and every run compared against
-          # nothing. Re-enabling `push:` would restore the old meaning; until
-          # then a dispatch from main is what establishes the baseline.
-          auto-push: ${{ github.ref == 'refs/heads/main' }}
-          save-data-file: ${{ github.ref == 'refs/heads/main' }}
-
-          # Regression gate thresholds (ratio of current/baseline).
-          #   150% -> 50% slower than baseline triggers a warning comment.
-          #   200% -> 100% slower fails the job.
-          alert-threshold: "150%"
-          fail-threshold: "200%"
-          fail-on-alert: true
-
-          summary-always: true
-          comment-on-alert: true
-          alert-comment-cc-users: "@${{ github.repository_owner }}"
-
-      # Feeds docs/benchmarks/latest.md through the VitePress data loader at
-      # docs/benchmarks/results.data.ts. `--quality degraded` is the default for
-      # GitHub-hosted runners on purpose: they are shared VMs whose wall-clock
-      # timings vary by tens of percent, and a run can look internally healthy
-      # (tight intervals) while being badly wrong in absolute terms. The page
-      # renders a warning banner off that field. Pass `ok` only from a runner
-      # you control and know to be quiet.
-      - name: Render benchmark JSON for the docs site
-        if: always()
+      # Deliberately NOT ./.github/actions/setup-rust-env, which every other job
+      # here uses. That action provisions the DEVELOPMENT environment -- mold,
+      # clippy/rustfmt/llvm-tools, cargo-binstall, every mise `cargo:` tool,
+      # comply and ignorefile -- and it builds that tooling with whatever
+      # toolchain is active. Pointing it at the MSRV therefore tried to compile
+      # the tooling with 1.88, and it died on the first tool that had moved on:
+      #
+      #   error: cannot install package `ignorefile-cli 0.1.0`, it requires
+      #   rustc 1.95 or newer, while the currently active rustc version is 1.88.0
+      #
+      # None of that tooling is part of the promise made to consumers, and a gate
+      # that fails because a lint helper wants a newer compiler reports nothing
+      # about the MSRV. So this job installs rustc and cargo at the declared
+      # floor and nothing else. rustup ships preinstalled on GitHub runners.
+      #
+      # Dropping the composite drops mold with it, which is why the step below
+      # must name RUSTFLAGS. See there.
+      #
+      # No target cache either: the gate's worth is its reliability, not its
+      # speed, it runs in the first tier in parallel, and `tests`/`build` set the
+      # critical path regardless. Add one only if this ever becomes the slow job.
+      - name: Install the declared MSRV toolchain
         env:
-          RUNNER_LABEL: ${{ runner.os }} / ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+          MSRV: ${{ steps.msrv.outputs.version }}
         run: |
-          set -Eeuo pipefail
-          python3 scripts/bench-to-json.py bench-output.txt \
-            -o docs/.data/benchmarks.json \
-            --quality degraded \
-            --runner "${RUNNER_LABEL}" \
-            --note "Measured on a shared GitHub-hosted runner. Ratios between libraries are the figures worth reading; absolute times vary between runs and are not comparable with the curated baseline."
+          set -euo pipefail
+          rustup toolchain install "$MSRV" --profile minimal --no-self-update
+          rustup run "$MSRV" rustc --version
 
-      # A pull request, never a push to main. Benchmark numbers from shared
-      # runners need a human to look at them before they become the published
-      # record -- exactly the review that would have caught the 2026-08-01 run,
-      # which was internally consistent and still 4.6x-20.9x wrong. This also
-      # keeps the docs deploy triggered by a normal merge rather than by a bot
-      # commit that bypasses branch protection.
-      - name: Open a PR with the refreshed benchmark data
-        if: github.ref == 'refs/heads/main'
-        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          add-paths: docs/.data/benchmarks.json
-          branch: bot/benchmark-data
-          delete-branch: true
-          commit-message: "docs(bench): refresh benchmark data from CI run"
-          title: "docs(bench): refresh benchmark data"
-          body: |
-            Automated refresh of `docs/.data/benchmarks.json` from the
-            Performance workflow. Rendered by `docs/benchmarks/latest.md`.
+      - name: Compile every publishable crate at the MSRV
+        env:
+          # Selects the toolchain installed above for every cargo/rustc call in
+          # this step; it outranks rust-toolchain.toml. This is the override that
+          # makes the job mean anything.
+          RUSTUP_TOOLCHAIN: ${{ steps.msrv.outputs.version }}
+          # REQUIRED, not tidiness. .cargo/config.toml's
+          # `[target.x86_64-unknown-linux-gnu]` sets
+          # `["-D", "warnings", "-C", "link-arg=-fuse-ld=mold"]`, and mold is
+          # installed by setup-rust-env -- which this job deliberately does not
+          # run. A RUSTFLAGS env var REPLACES that list rather than merging into
+          # it, so naming the flag here keeps the warning policy byte-for-byte
+          # while dropping a linker that is not on this runner.
+          #
+          # `cargo check` does NOT get a pass on that: it still builds and RUNS
+          # build scripts, and still compiles proc-macro crates, both of which
+          # link. This graph has ~30 of them (serde_derive, proc-macro2, quote,
+          # wasm-bindgen-macro, ...). Delete this line and the job fails at the
+          # first one, for a reason that has nothing to do with the MSRV.
+          #
+          # No `--target` is passed, so RUSTFLAGS reaches those host artifacts
+          # too, which is exactly what makes the override work.
+          #
+          # Warnings stay denied AT THE FLOOR because `lint` cannot cover this:
+          # it runs on the pinned toolchain, so a lint that fires on 1.88 but was
+          # renamed or removed by the pin would go unseen. Verified clean -- the
+          # check below passes with zero warnings on 1.88.
+          #
+          # The trade-off to watch as the floor and stable drift apart: an
+          # `#[allow]` naming a lint 1.88 has never heard of raises
+          # `unknown_lints`, which would fail a gate that blocks `release` for a
+          # reason that says nothing about MSRV. If that day comes, set this to
+          # "" rather than weakening the compile check -- `lint` still owns the
+          # warning gate on the pinned toolchain.
+          RUSTFLAGS: "-D warnings"
+        run: |
+          set -euo pipefail
+          # Derive the crate list instead of maintaining `--exclude` flags:
+          # cargo reports `publish` as [] for `publish = false` and null when
+          # publishing is allowed, so this selects exactly what a consumer can
+          # install from crates.io -- and a crate added tomorrow is covered the
+          # day it lands rather than escaping the gate until someone notices.
+          #
+          # bench/fuzz/yaml-test-suite are excluded by that rule, which is the
+          # point: dev-only crates drag in criterion, tarpaulin and a nightly
+          # requirement, and their floors are not part of the promise made to
+          # consumers. For the same reason this is `check`, not `test` -- running
+          # the suite would let a dev-dependency dictate the published MSRV.
+          mapfile -t names < <(
+            cargo metadata --format-version 1 --no-deps \
+              | jq -r '.packages[] | select(.publish != []) | .name' | sort
+          )
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "::error::no publishable crates resolved; refusing to pass vacuously"
+            exit 1
+          fi
+          packages=()
+          for name in "${names[@]}"; do packages+=(--package "${name}"); done
+          echo "MSRV $(rustc --version)"
+          printf 'Checking %s\n' "${names[@]}"
+          # `--all-features` because the floor has to hold for every feature a
+          # consumer can switch on; a default-only check would let an optional
+          # dependency raise the real MSRV without ever failing here.
+          cargo check --locked --all-features "${packages[@]}"
 
-            Measured on a shared GitHub-hosted runner, so the run is marked
-            `degraded`: read the ratios, not the absolute times, and do not copy
-            these figures into `docs/benchmarks/baseline.md`.
+  # benchmark:
+  #   name: Bench vs main baseline
+  #   runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+  #   # Moved here from workflow scope. A job block REPLACES the workflow default
+  #   # rather than merging with it, so this must restate every scope the job
+  #   # needs, `contents` included -- listing only the writes would silently drop
+  #   # read access.
+  #   permissions:
+  #     contents: write # push the updated baseline to gh-pages
+  #     pull-requests: write # post the comparison comment on PRs
+  #     deployments: write # required by benchmark-action for environments
+  #   timeout-minutes: 45
 
-      - name: Upload Criterion HTML reports
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: criterion-reports-${{ github.run_id }}
-          path: target/criterion/
-          retention-days: 30
-          if-no-files-found: warn
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+  #       with:
+  #         submodules: recursive
+  #         fetch-depth: 0
 
-      - name: Upload bencher-format measurements
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: bench-output-${{ github.run_id }}
-          path: bench-output.txt
-          retention-days: 90
+  #     - name: Setup Environment
+  #       uses: ./.github/actions/setup-rust-env
+
+  #     - name: Print runner profile
+  #       run: |
+  #         echo "::group::Runner profile"
+  #         echo "CPUs: $(nproc)"
+  #         echo "Mem:  $(free -h | awk '/Mem:/ {print $2}')"
+  #         uname -a
+  #         rustc --version
+  #         echo "::endgroup::"
+
+  #     - name: Reduce CPU frequency variance
+  #       run: |
+  #         sudo cpupower frequency-set --governor performance \
+  #           || echo "cpupower unavailable; continuing with default governor"
+
+  #     - name: Build benchmarks (warm cache, fail fast on compile errors)
+  #       run: cargo bench -p glaucus-bench --no-run
+
+  #     - name: Run benchmarks (bencher output format)
+  #       run: |
+  #         cargo bench -p glaucus-bench -- --output-format bencher \
+  #           | tee bench-output.txt
+
+  #     - name: Sanity-check parseable output
+  #       run: |
+  #         if ! grep -q "ns/iter" bench-output.txt; then
+  #           echo "::error::No 'ns/iter' lines found in bench-output.txt."
+  #           echo "Criterion may have failed before producing measurements."
+  #           tail -n 50 bench-output.txt
+  #           exit 1
+  #         fi
+  #         echo "Parsed $(grep -c 'ns/iter' bench-output.txt) benchmark measurements."
+
+  #     - name: Compare against baseline
+  #       uses: benchmark-action/github-action-benchmark@52576c92bccf6ac60c8223ec7eb2565637cae9ba # v1.22.1
+  #       with:
+  #         name: Glaucus benchmarks
+  #         tool: cargo
+  #         output-file-path: bench-output.txt
+  #         github-token: ${{ secrets.GITHUB_TOKEN }}
+
+  #         gh-pages-branch: gh-pages
+  #         # NOT `benchmarks`: gh-pages.yml publishes the VitePress site to the
+  #         # root of this same branch, and the site already emits
+  #         # benchmarks/baseline.html and benchmarks/latest.html. Sharing the
+  #         # directory means the action's index.html and the site's pages compete
+  #         # for the same paths -- today only `keep_files: true` on the docs
+  #         # deploy stops data.js being swept away. Separate directory, no race.
+  #         benchmark-data-dir-path: bench-data
+
+  #         # Gated on the branch alone, NOT on `github.event_name == 'push'`.
+  #         # The push trigger above is commented out, so event_name is always
+  #         # `workflow_dispatch` and both flags were permanently false: the
+  #         # baseline could never be written and every run compared against
+  #         # nothing. Re-enabling `push:` would restore the old meaning; until
+  #         # then a dispatch from main is what establishes the baseline.
+  #         auto-push: ${{ github.ref == 'refs/heads/main' }}
+  #         save-data-file: ${{ github.ref == 'refs/heads/main' }}
+
+  #         # Regression gate thresholds (ratio of current/baseline).
+  #         #   150% -> 50% slower than baseline triggers a warning comment.
+  #         #   200% -> 100% slower fails the job.
+  #         alert-threshold: "150%"
+  #         fail-threshold: "200%"
+  #         fail-on-alert: true
+
+  #         summary-always: true
+  #         comment-on-alert: true
+  #         alert-comment-cc-users: "@${{ github.repository_owner }}"
+
+  #     # Feeds docs/benchmarks/latest.md through the VitePress data loader at
+  #     # docs/benchmarks/results.data.ts. `--quality degraded` is the default for
+  #     # GitHub-hosted runners on purpose: they are shared VMs whose wall-clock
+  #     # timings vary by tens of percent, and a run can look internally healthy
+  #     # (tight intervals) while being badly wrong in absolute terms. The page
+  #     # renders a warning banner off that field. Pass `ok` only from a runner
+  #     # you control and know to be quiet.
+  #     - name: Render benchmark JSON for the docs site
+  #       if: always()
+  #       env:
+  #         RUNNER_LABEL: ${{ runner.os }} / ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+  #       run: |
+  #         set -Eeuo pipefail
+  #         python3 scripts/bench-to-json.py bench-output.txt \
+  #           -o docs/.data/benchmarks.json \
+  #           --quality degraded \
+  #           --runner "${RUNNER_LABEL}" \
+  #           --note "Measured on a shared GitHub-hosted runner. Ratios between libraries are the figures worth reading; absolute times vary between runs and are not comparable with the curated baseline."
+
+  #     # A pull request, never a push to main. Benchmark numbers from shared
+  #     # runners need a human to look at them before they become the published
+  #     # record -- exactly the review that would have caught the 2026-08-01 run,
+  #     # which was internally consistent and still 4.6x-20.9x wrong. This also
+  #     # keeps the docs deploy triggered by a normal merge rather than by a bot
+  #     # commit that bypasses branch protection.
+  #     - name: Open a PR with the refreshed benchmark data
+  #       if: github.ref == 'refs/heads/main'
+  #       uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+  #       with:
+  #         token: ${{ secrets.GITHUB_TOKEN }}
+  #         add-paths: docs/.data/benchmarks.json
+  #         branch: bot/benchmark-data
+  #         delete-branch: true
+  #         commit-message: "docs(bench): refresh benchmark data from CI run"
+  #         title: "docs(bench): refresh benchmark data"
+  #         body: |
+  #           Automated refresh of `docs/.data/benchmarks.json` from the
+  #           Performance workflow. Rendered by `docs/benchmarks/latest.md`.
+
+  #           Measured on a shared GitHub-hosted runner, so the run is marked
+  #           `degraded`: read the ratios, not the absolute times, and do not copy
+  #           these figures into `docs/benchmarks/baseline.md`.
+
+  #     - name: Upload Criterion HTML reports
+  #       if: always()
+  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+  #       with:
+  #         name: criterion-reports-${{ github.run_id }}
+  #         path: target/criterion/
+  #         retention-days: 30
+  #         if-no-files-found: warn
+
+  #     - name: Upload bencher-format measurements
+  #       if: always()
+  #       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+  #       with:
+  #         name: bench-output-${{ github.run_id }}
+  #         path: bench-output.txt
+  #         retention-days: 90
