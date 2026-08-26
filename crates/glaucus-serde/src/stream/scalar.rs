@@ -6,11 +6,6 @@
 //!
 //! Fills a typed target without a `Node` tree existing.
 
-// Constructed only by tests until #53 wires collections and #57 routes
-// `from_str`. Scoped to this module and tied to those issues -- delete it when
-// #53 lands and the compiler will confirm it is no longer needed.
-#![allow(dead_code)]
-
 use std::borrow::Cow;
 
 use glaucus_core::types::{ScalarStyle, Tag, YamlVersion};

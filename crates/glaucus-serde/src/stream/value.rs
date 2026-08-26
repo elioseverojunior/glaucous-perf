@@ -4,11 +4,6 @@
 
 //! A `serde::Deserializer` over the event stream, for values of any shape.
 
-// Constructed only by tests until #57 routes `from_str` through the streaming
-// path. Scoped to this module and tied to that issue -- delete it when #57
-// lands and the compiler will confirm it is no longer needed.
-#![allow(dead_code)]
-
 use glaucus_core::error::Result as CoreResult;
 use glaucus_core::parser::event::{Event, EventKind};
 use glaucus_core::types::{Tag, YamlVersion};
@@ -65,6 +60,10 @@ pub(crate) struct EventDeserializer<'a, 'de, S: EventSource<'de>> {
 }
 
 impl<'a, 'de, S: EventSource<'de>> EventDeserializer<'a, 'de, S> {
+    // Reachable only from tests until #57 routes `from_str` through the
+    // streaming path. Scoped to the individual item rather than the module so
+    // anything that becomes dead LATER is still reported.
+    #[allow(dead_code)]
     pub(crate) const fn new(source: &'a mut S, version: YamlVersion) -> Self {
         Self {
             source,
@@ -110,6 +109,7 @@ impl<'a, 'de, S: EventSource<'de>> EventDeserializer<'a, 'de, S> {
     }
 
     /// Skips the stream and document framing the parser wraps a value in.
+    #[allow(dead_code)]
     pub(crate) fn skip_framing(&mut self) -> Result<(), Error> {
         while self.peek()? == Some(Peek::Framing) {
             self.take()?;
@@ -475,5 +475,179 @@ mod tests {
         // The trailing framing is skipped just as the leading framing was.
         de.skip_framing().unwrap();
         assert_eq!(de.peek().unwrap(), None);
+    }
+
+    // --- anchors and aliases (#54) -----------------------------------------
+
+    #[test]
+    fn an_alias_resolves_to_its_anchor() {
+        let got: BTreeMap<String, Vec<i64>> = from_yaml("a: &x [1, 2]\nb: *x\n").unwrap();
+        assert_eq!(got["a"], vec![1, 2]);
+        assert_eq!(got["b"], got["a"]);
+    }
+
+    #[test]
+    fn an_alias_to_a_scalar_resolves() {
+        let got: BTreeMap<String, i64> = from_yaml("a: &x 7\nb: *x\n").unwrap();
+        assert_eq!(got["b"], 7);
+    }
+
+    #[test]
+    fn nested_anchors_resolve_independently_and_when_nested() {
+        // `y` sits inside `x`. Replaying `x` must reproduce `y`'s events rather
+        // than a marker, and `y` must still resolve on its own afterwards.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Inner {
+            p: Vec<i64>,
+            q: Vec<i64>,
+        }
+
+        let got: BTreeMap<String, Inner> =
+            from_yaml("a: &x {p: &y [1, 2], q: *y}\nb: *x\n").unwrap();
+        assert_eq!(got["a"].p, vec![1, 2]);
+        assert_eq!(got["a"].q, vec![1, 2]);
+        assert_eq!(got["b"], got["a"]);
+    }
+
+    #[test]
+    fn an_alias_inside_an_anchored_value_survives_replay() {
+        // `z`'s recorded span contains an alias event. Replaying `z` must expand
+        // that alias again rather than skipping it -- the case that breaks if
+        // replayed events are recorded instead of the alias itself.
+        // A struct, not a map: the three values have different shapes, and a
+        // uniform map value type would fail on `a` before reaching the alias.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            a: Vec<i64>,
+            z: Vec<Vec<i64>>,
+            c: Vec<Vec<i64>>,
+        }
+
+        let got: Doc = from_yaml("a: &x [1]\nz: &z [*x, *x]\nc: *z\n").unwrap();
+        assert_eq!(got.a, vec![1]);
+        assert_eq!(got.z, vec![vec![1], vec![1]]);
+        assert_eq!(got.c, got.z);
+    }
+
+    #[test]
+    fn an_anchor_aliased_repeatedly_resolves_every_time() {
+        let got: BTreeMap<String, Vec<i64>> =
+            from_yaml("a: &x [1]\nb: *x\nc: *x\nd: *x\n").unwrap();
+        for key in ["b", "c", "d"] {
+            assert_eq!(got[key], vec![1], "{key}");
+        }
+    }
+
+    #[test]
+    fn an_undefined_alias_is_an_error() {
+        let msg = from_yaml::<BTreeMap<String, i64>>("a: *nope\n")
+            .expect_err("undefined alias deserialized")
+            .to_string();
+        assert!(msg.contains("undefined alias"), "{msg}");
+    }
+
+    #[test]
+    fn an_anchor_cannot_alias_itself() {
+        // At `*x` the scope for `x` is still open, so `x` is not yet a defined
+        // anchor. That is what stops a self-referential document from looping.
+        let got = from_yaml::<BTreeMap<String, Vec<i64>>>("a: &x [*x]\n");
+        assert!(got.is_err(), "self-referential alias resolved: {got:?}");
+    }
+
+    /// A float compared so that `NaN` equals `NaN`.
+    ///
+    /// IEEE 754 says `NaN != NaN`, so a derived comparison reports `.nan` as a
+    /// disagreement on every run -- the harness would fail permanently on a document
+    /// both engines handled identically, and a harness that always fails detects
+    /// nothing. Equality here asks the question the harness actually means: did the
+    /// two engines produce the same value?
+    #[derive(Debug, Deserialize)]
+    #[serde(transparent)]
+    struct F64(f64);
+
+    impl PartialEq for F64 {
+        fn eq(&self, other: &Self) -> bool {
+            // Bit equality would also split +0.0 from -0.0, which the engines are
+            // not expected to distinguish, so `==` still decides the ordinary case.
+            (self.0.is_nan() && other.0.is_nan()) || self.0 == other.0
+        }
+    }
+
+    /// A span-free, style-free view of a document, for comparing two engines.
+    ///
+    /// `Value` cannot do this job. Its `PartialEq` compares `span` and `style`,
+    /// and neither survives serde's data model -- the streaming path builds
+    /// values from `Visitor` calls that carry no source position, so every
+    /// document would report a difference and the real ones would be buried.
+    /// What must agree across engines is the structure and the scalar text.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(untagged)]
+    enum Shape {
+        // Order matters: serde tries these top to bottom. Collections first so a
+        // sequence is never mistaken for a string, and Int before Float so a
+        // whole number does not silently become 1.0 on one path only.
+        Seq(Vec<Self>),
+        Map(BTreeMap<String, Self>),
+        Bool(bool),
+        Int(i64),
+        Float(F64),
+        Str(String),
+        Null,
+    }
+
+    /// The acceptance criterion of #54: every anchor shape must produce the same
+    /// value on both engines.
+    ///
+    /// The differential harness in `tests/differential.rs` cannot do this yet --
+    /// it is a separate crate and the streaming types are `pub(crate)` until #57
+    /// routes `from_str`. Comparing here keeps the guarantee tested rather than
+    /// deferred to an integration task, which is what #54 asks for.
+    #[test]
+    fn anchors_agree_with_the_tree_path() {
+        const CASES: &[&str] = &[
+            "a: &x 1\nb: *x\n",
+            "a: &x {p: 1, q: 2}\nb: *x\n",
+            "a: &x [1, 2, 3]\nb: *x\n",
+            "a: &outer\n  inner: &in [1, 2]\n  other: *in\nb: *outer\n",
+            "a: &x [1, 2]\nb: *x\nc: *x\nd: *x\ne: *x\n",
+            "a: &x [1]\nz: &z [*x, *x]\nc: *z\n",
+            "a: &x {p: &y [1, 2], q: *y}\nb: *x\n",
+            // An anchor that is never aliased must not change the result.
+            "a: &unused [1, 2]\nb: 3\n",
+            // A redefined anchor: the later definition wins.
+            "a: &x 1\nb: &x 2\nc: *x\n",
+        ];
+
+        let mut disagreements = Vec::new();
+        for yaml in CASES {
+            let tree = crate::from_str::<Shape>(yaml).map_err(|e| e.to_string());
+            let streaming = from_yaml::<Shape>(yaml).map_err(|e| e.to_string());
+
+            match (&tree, &streaming) {
+                (Ok(t), Ok(s)) if t == s => {}
+                _ => disagreements.push(format!(
+                    "{yaml:?}\n  tree      = {tree:?}\n  streaming = {streaming:?}"
+                )),
+            }
+        }
+
+        assert!(
+            disagreements.is_empty(),
+            "{} of {} anchor cases disagree:\n\n{}",
+            disagreements.len(),
+            CASES.len(),
+            disagreements.join("\n\n")
+        );
+    }
+
+    #[test]
+    fn a_self_referential_anchor_is_an_undefined_alias() {
+        // Stronger than "it errors": before #54 this failed with "expected a
+        // value, found alias", which would have passed a mere is_err check while
+        // proving nothing about loop safety.
+        let msg = from_yaml::<BTreeMap<String, Vec<i64>>>("a: &x [*x]\n")
+            .expect_err("self-referential alias resolved")
+            .to_string();
+        assert!(msg.contains("undefined alias"), "{msg}");
     }
 }

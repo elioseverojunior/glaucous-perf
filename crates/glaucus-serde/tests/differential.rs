@@ -22,7 +22,58 @@
 //! function as [`via_tree`] and every case passes trivially. **That is the
 //! point.**
 
-use glaucus_serde::{Value, from_str};
+use std::collections::BTreeMap;
+
+use serde::Deserialize;
+
+use glaucus_serde::from_str;
+
+/// A float compared so that `NaN` equals `NaN`.
+///
+/// IEEE 754 says `NaN != NaN`, so a derived comparison reports `.nan` as a
+/// disagreement on every run -- the harness would fail permanently on a document
+/// both engines handled identically, and a harness that always fails detects
+/// nothing. Equality here asks the question the harness actually means: did the
+/// two engines produce the same value?
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+struct F64(f64);
+
+impl PartialEq for F64 {
+    fn eq(&self, other: &Self) -> bool {
+        // Bit equality would also split +0.0 from -0.0, which the engines are
+        // not expected to distinguish, so `==` still decides the ordinary case.
+        (self.0.is_nan() && other.0.is_nan()) || self.0 == other.0
+    }
+}
+
+/// A span-free, style-free view of a document.
+///
+/// **Not `Value`.** `Value`'s `PartialEq` compares `span` and `style`, and
+/// neither survives serde's data model: the streaming path builds values from
+/// `Visitor` calls that carry no source position, and infers a default style. A
+/// `Value` comparison is therefore green only while both sides call the SAME
+/// function -- the moment #57 makes them differ it would report all of the
+/// corpus as disagreeing, and a harness that always fails detects nothing.
+///
+/// What must agree across two engines is the structure and the scalar text,
+/// which is what this captures. It is still shape-preserving: a typed struct
+/// would silently discard any field the two paths disagreed about, which is
+/// exactly the disagreement this exists to catch.
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum Shape {
+    // Order matters: serde tries these top to bottom. Collections first so a
+    // sequence is never mistaken for a string, and Int before Float so a whole
+    // number does not silently become 1.0 on one path only.
+    Seq(Vec<Self>),
+    Map(BTreeMap<String, Self>),
+    Bool(bool),
+    Int(i64),
+    Float(F64),
+    Str(String),
+    Null,
+}
 
 /// One corpus entry. The name is carried so a failure says which case broke.
 struct Case {
@@ -31,8 +82,8 @@ struct Case {
 }
 
 /// Deserialises through the `Node` tree: compose, then walk the tree.
-fn via_tree(yaml: &str) -> Result<Value, String> {
-    from_str::<Value>(yaml).map_err(|e| e.to_string())
+fn via_tree(yaml: &str) -> Result<Shape, String> {
+    from_str::<Shape>(yaml).map_err(|e| e.to_string())
 }
 
 /// Deserialises through the parser event stream, without composing a tree.
@@ -40,8 +91,8 @@ fn via_tree(yaml: &str) -> Result<Value, String> {
 /// Identical to [`via_tree`] until #57. Kept as a separate function so the switch
 /// is a one-line change here rather than a rewrite of the harness, and so the
 /// corpus is already green when the second engine arrives.
-fn via_streaming(yaml: &str) -> Result<Value, String> {
-    from_str::<Value>(yaml).map_err(|e| e.to_string())
+fn via_streaming(yaml: &str) -> Result<Shape, String> {
+    from_str::<Shape>(yaml).map_err(|e| e.to_string())
 }
 
 /// Asserts both paths agree on whether `yaml` parses, and on what it produces.
@@ -51,9 +102,7 @@ fn via_streaming(yaml: &str) -> Result<Value, String> {
 /// that as a difference would bury the real signal. What must match is the
 /// verdict — accept or reject — and, when accepted, the value.
 ///
-/// The target is [`Value`] because it is shape-preserving. A typed struct would
-/// silently discard any field the two paths disagreed about, which is exactly the
-/// disagreement this exists to catch.
+/// The target is [`Shape`]; see its documentation for why not [`Value`].
 fn assert_paths_agree(name: &str, yaml: &str) -> Option<String> {
     match (via_tree(yaml), via_streaming(yaml)) {
         (Ok(tree), Ok(streaming)) => (tree != streaming).then(|| {

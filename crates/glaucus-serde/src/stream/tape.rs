@@ -8,18 +8,14 @@
 //! streaming path has no nodes, so it must replay the **events** that built the
 //! anchored value instead. That difference is the whole reason this type exists.
 
-// Nothing consumes the tape yet: #52 through #56 are its callers, and each lands
-// with its own tests. Scoped to this module and tied to those issues rather than
-// left open-ended -- delete it when #52 lands and the compiler will confirm it is
-// no longer needed. (#42 carried the same allow and #43 removed it on schedule.)
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::ops::Range;
 
-use glaucus_core::error::{ParserConfig, Result};
+use glaucus_core::error::{Error, ErrorKind, ParserConfig, Result};
+use glaucus_core::limits::ResourceLimits;
 use glaucus_core::parser::Parser;
 use glaucus_core::parser::event::{Event, EventKind};
+use glaucus_core::types::Span;
 
 /// Returns the anchor an event declares, if any.
 ///
@@ -37,6 +33,7 @@ fn declared_anchor<'e>(event: &'e Event<'_>) -> Option<&'e str> {
 }
 
 /// Parser events, with the ability to replay an anchored span.
+#[allow(dead_code)]
 pub(crate) struct Tape<'a> {
     parser: Parser<'a>,
     /// Every recorded event, in one flat buffer.
@@ -48,13 +45,35 @@ pub(crate) struct Tape<'a> {
     buffer: Vec<Event<'a>>,
     /// Anchor name to its half-open range in `buffer`.
     anchors: HashMap<String, Range<usize>>,
-    /// Anchors whose value is still being read, innermost last.
+    /// Anchors whose value is still being read, innermost last: name, where the
+    /// span starts, and the nesting depth the anchor was declared at.
     ///
     /// Recording continues while this is non-empty, so an outer anchor still open
-    /// keeps collecting after an inner one closes.
-    open: Vec<(String, usize)>,
+    /// keeps collecting after an inner one closes. The depth is what says when a
+    /// scope closes: a scalar anchor closes at once, a collection anchor at its
+    /// matching end event.
+    open: Vec<(String, usize, usize)>,
+    /// Nesting depth of the events read from the parser.
+    depth: usize,
+    /// Spans still being replayed, innermost last.
+    ///
+    /// A stack rather than one cursor: an alias inside an anchored value expands
+    /// while that value is itself being replayed.
+    replaying: Vec<Range<usize>>,
+    /// How many aliases have been expanded, and how many events that produced.
+    ///
+    /// Expansion is where a small document becomes a large one -- `&a`, then `*a`
+    /// twice under `&b`, then `*b` twice under `&c` doubles at every level. The
+    /// streaming path never materialises the result, so memory stays flat, but
+    /// the time still grows exponentially. Both counters are charged before any
+    /// replay begins.
+    expansions: usize,
+    expanded_events: usize,
+    /// Limits governing the two counters above.
+    limits: ResourceLimits,
 }
 
+#[allow(dead_code)]
 impl<'a> Tape<'a> {
     /// Creates a tape over `input` with default parser configuration.
     pub(crate) fn new(input: &'a str) -> Self {
@@ -63,63 +82,167 @@ impl<'a> Tape<'a> {
 
     /// Creates a tape over `input` with caller-supplied parser configuration.
     pub(crate) fn with_config(input: &'a str, config: ParserConfig) -> Self {
+        let limits = config.limits.clone();
         Self {
+            limits,
             parser: Parser::with_config(input, config),
             buffer: Vec::new(),
             anchors: HashMap::new(),
             open: Vec::new(),
+            depth: 0,
+            replaying: Vec::new(),
+            expansions: 0,
+            expanded_events: 0,
         }
     }
 
-    /// Yields the next event, recording it when it may later need replaying.
+    /// Yields the next event, resolving aliases and recording anchored spans.
     ///
     /// Recording is **lazy**: the buffer stays empty until an anchor is actually
     /// seen. Most documents contain none, and allocating a tape for them would
     /// make every ordinary parse pay for a feature it does not use.
     ///
-    /// An event is recorded when either an anchor scope is open — it is part of
-    /// some anchored value — or the event itself declares an anchor, since a
-    /// caller that then calls [`begin_anchor`](Self::begin_anchor) needs this
-    /// event to be the first of the recorded span. Reading the anchor here is
-    /// what makes that possible without buffering speculatively.
+    /// An alias never reaches the caller. It is replaced by the events of the
+    /// value it names, so a consumer deserialises an aliased value with no
+    /// knowledge that aliases exist. Doing this here rather than in the
+    /// deserialiser is what keeps anchor bookkeeping in one place: the tape knows
+    /// where every span starts and ends, and nothing else has to agree with it.
     pub(crate) fn next(&mut self) -> Option<Result<Event<'a>>> {
-        let event = match self.parser.next_event()? {
-            Ok(e) => e,
-            Err(e) => return Some(Err(e)),
-        };
+        loop {
+            // `pull` reports where the event came from. Deciding that here
+            // instead -- from `replaying.is_empty()` before the call -- reads an
+            // exhausted frame that `pull` is about to discard, so the next PARSER
+            // event is mistaken for a replayed one: it goes unrecorded and its
+            // enclosing anchor scope never closes, surfacing later as a bogus
+            // undefined alias. One source of truth avoids the ordering entirely.
+            let (live, result) = self.pull()?;
+            let event = match result {
+                Ok(event) => event,
+                Err(e) => return Some(Err(e)),
+            };
 
-        if !self.open.is_empty() || declared_anchor(&event).is_some() {
+            if live {
+                self.record(&event);
+            }
+
+            // The ALIAS event is what gets recorded above, not its expansion.
+            // Replaying a span that contains one therefore expands it again --
+            // which is what makes `&z [*x]` reproduce `x` when `*z` is resolved.
+            if let EventKind::Alias { name } = &event.kind {
+                if let Err(e) = self.expand(name, event.span) {
+                    return Some(Err(e));
+                }
+                continue;
+            }
+
+            if live {
+                self.advance_scopes(&event);
+            }
+            return Some(Ok(event));
+        }
+    }
+
+    /// Takes the next event, and reports whether it came from the parser.
+    ///
+    /// Retiring finished replays and answering "is this live?" belong together:
+    /// the answer is only correct once the exhausted frames are gone, and any
+    /// caller that asked separately would have to get the order right.
+    fn pull(&mut self) -> Option<(bool, Result<Event<'a>>)> {
+        while let Some(range) = self.replaying.last_mut() {
+            if range.start < range.end {
+                let index = range.start;
+                range.start += 1;
+                // In bounds by construction, so indexing cannot panic on a
+                // hostile document: `buffer` is append-only and every range is
+                // built as `start..buffer.len()`, so `end` can never outrun it.
+                return Some((false, Ok(self.buffer[index].clone())));
+            }
+            self.replaying.pop();
+        }
+        Some((true, self.parser.next_event()?))
+    }
+
+    /// Buffers an event when it may later need replaying, and opens any scope it
+    /// declares.
+    fn record(&mut self, event: &Event<'a>) {
+        let anchor = declared_anchor(event).map(str::to_owned);
+
+        // Recorded when either a scope is open -- the event is part of some
+        // anchored value -- or the event declares an anchor, since the span has
+        // to start AT that event rather than after it.
+        if !self.open.is_empty() || anchor.is_some() {
             self.buffer.push(event.clone());
         }
 
-        Some(Ok(event))
-    }
-
-    /// Opens an anchor scope starting at the most recently yielded event.
-    ///
-    /// Call this immediately after [`next`](Self::next) returns an event whose
-    /// anchor you intend to record. The event is already in the buffer — that is
-    /// what the anchor check in `next` is for — so the span starts at it rather
-    /// than after it, and a replay reproduces the whole value including the
-    /// `SequenceStart` or `MappingStart` that gives it its shape.
-    pub(crate) fn begin_anchor(&mut self, name: &str) {
-        // `saturating_sub` rather than `- 1`: a caller that opens a scope without
-        // a preceding event gets an empty span, not a panic on an attacker-shaped
-        // document.
-        let start = self.buffer.len().saturating_sub(1);
-        self.open.push((name.to_owned(), start));
-    }
-
-    /// Closes the innermost open anchor scope and records its span.
-    ///
-    /// A repeated anchor name overwrites the earlier span, matching YAML: an
-    /// anchor may be redefined, and a later alias refers to the most recent
-    /// definition.
-    pub(crate) fn end_anchor(&mut self) {
-        if let Some((name, start)) = self.open.pop() {
-            let end = self.buffer.len();
-            self.anchors.insert(name, start..end);
+        if let Some(name) = anchor {
+            let start = self.buffer.len().saturating_sub(1);
+            self.open.push((name, start, self.depth));
         }
+    }
+
+    /// Tracks nesting depth and closes every scope the event completes.
+    fn advance_scopes(&mut self, event: &Event<'a>) {
+        match event.kind {
+            EventKind::SequenceStart { .. } | EventKind::MappingStart { .. } => {
+                self.depth += 1;
+            }
+            EventKind::SequenceEnd | EventKind::MappingEnd => {
+                // `saturating_sub`: an unbalanced end event is a malformed
+                // document, which arrives from outside. It must not underflow.
+                self.depth = self.depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+
+        // A scope closes once the stream is back at the depth it opened at: a
+        // scalar anchor never changed the depth, so it closes immediately, while
+        // a collection anchor waits for its matching end event.
+        while self.open.last().is_some_and(|&(_, _, d)| d >= self.depth) {
+            if let Some((name, start, _)) = self.open.pop() {
+                // A repeated anchor name overwrites the earlier span, matching
+                // YAML: an anchor may be redefined and a later alias refers to
+                // the most recent definition.
+                self.anchors.insert(name, start..self.buffer.len());
+            }
+        }
+    }
+
+    /// Queues the events of `name` for replay.
+    ///
+    /// An anchor still being read is deliberately absent from `anchors`, so
+    /// `&x [*x]` reports an undefined alias instead of looping forever.
+    fn expand(&mut self, name: &str, span: Span) -> Result<()> {
+        let Some(range) = self.anchors.get(name).cloned() else {
+            return Err(Error::new(
+                ErrorKind::UndefinedAlias(name.to_string()),
+                span,
+            ));
+        };
+
+        // Charged BEFORE the replay is queued, so a document cannot spend the
+        // budget and then be told it was over it.
+        self.expansions += 1;
+        if self.expansions > self.limits.max_alias_expansions {
+            return Err(Error::new(
+                ErrorKind::AliasExpansionLimitExceeded {
+                    limit: self.limits.max_alias_expansions,
+                },
+                span,
+            ));
+        }
+
+        self.expanded_events += range.len();
+        if self.expanded_events > self.limits.max_total_alias_nodes {
+            return Err(Error::new(
+                ErrorKind::AliasMaterializationLimitExceeded {
+                    limit: self.limits.max_total_alias_nodes,
+                },
+                span,
+            ));
+        }
+
+        self.replaying.push(range);
+        Ok(())
     }
 
     /// The events that built `name`, or `None` if it was never anchored.
@@ -127,6 +250,7 @@ impl<'a> Tape<'a> {
     /// `None` rather than a panic: an undefined alias is a defect in the
     /// *document*, which arrives from outside, so it must be an error the caller
     /// can report rather than a crash.
+    #[allow(dead_code)]
     pub(crate) fn replay(&self, name: &str) -> Option<&[Event<'a>]> {
         let range = self.anchors.get(name)?;
         self.buffer.get(range.clone())
@@ -144,48 +268,17 @@ impl<'a> Tape<'a> {
 
 #[cfg(test)]
 mod tests {
+    use glaucus_core::error::ParserConfig;
+
     use super::Tape;
 
-    /// Drives the tape to exhaustion, opening and closing anchor scopes the way a
-    /// consumer would: `begin_anchor` on an anchored event, `end_anchor` when that
-    /// value's scope closes.
+    /// Drives the tape to exhaustion.
+    ///
+    /// Nothing to co-operate with: the tape opens and closes anchor scopes
+    /// itself, so a consumer only has to keep calling `next`.
     fn drive(input: &str) -> Tape<'_> {
-        use glaucus_core::parser::event::EventKind;
-
         let mut tape = Tape::new(input);
-        // Depth at which each open anchor was declared, so the matching close is
-        // recognised. A scalar anchor closes immediately; a collection anchor
-        // closes at its own End event.
-        let mut pending: Vec<usize> = Vec::new();
-        let mut depth = 0usize;
-
-        while let Some(Ok(event)) = tape.next() {
-            let anchor = super::declared_anchor(&event).map(str::to_owned);
-
-            match event.kind {
-                EventKind::SequenceStart { .. } | EventKind::MappingStart { .. } => {
-                    if let Some(name) = &anchor {
-                        tape.begin_anchor(name);
-                        pending.push(depth);
-                    }
-                    depth += 1;
-                }
-                EventKind::SequenceEnd | EventKind::MappingEnd => {
-                    depth -= 1;
-                    if pending.last() == Some(&depth) {
-                        pending.pop();
-                        tape.end_anchor();
-                    }
-                }
-                EventKind::Scalar { .. } => {
-                    if let Some(name) = &anchor {
-                        tape.begin_anchor(name);
-                        tape.end_anchor();
-                    }
-                }
-                _ => {}
-            }
-        }
+        while let Some(Ok(_)) = tape.next() {}
         tape
     }
 
@@ -277,11 +370,61 @@ mod tests {
     }
 
     #[test]
-    fn end_anchor_without_a_matching_begin_is_a_no_op() {
-        let mut tape = Tape::new("a: 1\n");
-        tape.end_anchor();
-        tape.end_anchor();
-        assert_eq!(tape.buffered_events(), 0);
-        assert!(tape.replay("anything").is_none());
+    fn an_unbalanced_end_event_does_not_underflow_the_depth() {
+        // A stray `]` is a malformed document, which arrives from outside. The
+        // depth counter must saturate rather than wrap to usize::MAX and leave
+        // every later anchor scope permanently open.
+        for input in ["a: 1\n]\n", "]\n", "a: &x [1]\n]\n"] {
+            let tape = drive(input);
+            let _ = tape.buffered_events();
+        }
+    }
+
+    /// Drives the tape to exhaustion, returning the first error it reports.
+    fn drive_err(input: &str, config: ParserConfig) -> Option<String> {
+        let mut tape = Tape::with_config(input, config);
+        while let Some(result) = tape.next() {
+            if let Err(e) = result {
+                return Some(e.to_string());
+            }
+        }
+        None
+    }
+
+    /// Expansion is where a small document becomes a large one. The streaming
+    /// path never materialises the result, so memory stays flat -- but the time
+    /// still grows exponentially, so the budget has to be charged here too.
+    #[test]
+    fn the_alias_expansion_budget_is_enforced() {
+        let mut config = ParserConfig::default();
+        config.limits.max_alias_expansions = 1;
+
+        let input = "a: &x 1\nb: *x\nc: *x\n";
+        assert!(
+            drive_err(input, config.clone()).is_some_and(|e| e.contains("alias expansion")),
+            "a second expansion must exceed a budget of one"
+        );
+
+        // The budget is a ceiling, not a trap: one expansion is still allowed.
+        assert_eq!(drive_err("a: &x 1\nb: *x\n", config), None);
+    }
+
+    /// A separate budget from the expansion count: few aliases can still name
+    /// large spans, which is the amplification the count alone would not catch.
+    #[test]
+    fn the_total_expanded_event_budget_is_enforced() {
+        let mut config = ParserConfig::default();
+        config.limits.max_total_alias_nodes = 2;
+
+        // `x` is five events (start, three scalars, end), so one alias to it
+        // already exceeds a budget of two.
+        let input = "a: &x [1, 2, 3]\nb: *x\n";
+        assert!(
+            drive_err(input, config.clone()).is_some_and(|e| e.contains("alias")),
+            "a span larger than the budget must be refused"
+        );
+
+        // A one-event anchor stays under it.
+        assert_eq!(drive_err("a: &x 1\nb: *x\n", config), None);
     }
 }
