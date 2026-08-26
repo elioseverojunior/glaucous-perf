@@ -4,12 +4,12 @@
 
 //! A `serde::Deserializer` over the event stream, for values of any shape.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 use glaucus_core::error::Result as CoreResult;
 use glaucus_core::parser::event::{Event, EventKind};
-use glaucus_core::types::{Tag, YamlVersion};
-use serde::de::{self, DeserializeSeed, Visitor};
+use glaucus_core::types::{Position, ScalarStyle, Span, Tag, YamlVersion};
+use serde::de::{self, DeserializeOwned, DeserializeSeed, Visitor};
 
 use crate::error::Error;
 use crate::stream::scalar::ScalarDeserializer;
@@ -182,6 +182,157 @@ fn merge_value_error(events: &[Event<'_>]) -> Error {
     ))
 }
 
+/// The variant an event run names through a `!Variant` local tag, if any.
+fn variant_tag_of(events: &[Event<'_>]) -> Option<String> {
+    let event = events.first()?;
+    let (handle, suffix) = match &event.kind {
+        EventKind::Scalar { tag, .. }
+        | EventKind::SequenceStart { tag, .. }
+        | EventKind::MappingStart { tag, .. } => tag.clone()?,
+        _ => return None,
+    };
+    let tag = Tag::resolve(handle, suffix, event.span);
+    crate::de::external_variant_tag(&tag).map(str::to_owned)
+}
+
+/// One enum variant, in whichever of the three forms it arrived.
+enum Variant<'de> {
+    /// A plain scalar naming a unit variant.
+    Unit(Vec<Event<'de>>),
+    /// A single-key mapping: the key names the variant, the value is its data.
+    Keyed(Vec<Event<'de>>, Vec<Event<'de>>),
+    /// A `!Variant` local tag: the name is the tag, the data is the whole value.
+    Tagged(String, Vec<Event<'de>>),
+}
+
+/// Reads a variant name, then hands the data to [`VariantAccess`].
+struct EnumAccess<'de> {
+    variant: Variant<'de>,
+    options: StreamOptions,
+}
+
+impl<'de> de::EnumAccess<'de> for EnumAccess<'de> {
+    type Error = Error;
+    type Variant = VariantAccess<'de>;
+
+    fn variant_seed<V: DeserializeSeed<'de>>(
+        self,
+        seed: V,
+    ) -> Result<(V::Value, Self::Variant), Error> {
+        let options = self.options;
+        match self.variant {
+            Variant::Unit(name) => {
+                let mut source = SliceSource::new(name);
+                let mut de = EventDeserializer::new(&mut source, options);
+                Ok((seed.deserialize(&mut de)?, VariantAccess::Unit))
+            }
+            Variant::Keyed(name, value) => {
+                let mut source = SliceSource::new(name);
+                let mut de = EventDeserializer::new(&mut source, options);
+                let variant = seed.deserialize(&mut de)?;
+                Ok((variant, VariantAccess::Value(value, options)))
+            }
+            Variant::Tagged(name, value) => {
+                // The name came from the tag, not from the stream, so it is
+                // deserialised from the string itself.
+                let de = de::IntoDeserializer::<Error>::into_deserializer(name.as_str());
+                Ok((seed.deserialize(de)?, VariantAccess::Value(value, options)))
+            }
+        }
+    }
+}
+
+/// The data belonging to a variant, if it has any.
+enum VariantAccess<'de> {
+    Unit,
+    Value(Vec<Event<'de>>, StreamOptions),
+}
+
+impl<'de> VariantAccess<'de> {
+    /// Deserialises the variant's data, or reports that it has none.
+    fn with_data<T>(
+        self,
+        expected: &str,
+        f: impl FnOnce(&mut EventDeserializer<'_, 'de, SliceSource<'de>>) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        match self {
+            Self::Value(events, options) => {
+                let mut source = SliceSource::new(events);
+                let mut de = EventDeserializer::new(&mut source, options);
+                f(&mut de)
+            }
+            Self::Unit => Err(err(format!("expected {expected} variant"))),
+        }
+    }
+}
+
+impl<'de> de::VariantAccess<'de> for VariantAccess<'de> {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<(), Error> {
+        match self {
+            Self::Unit => Ok(()),
+            Self::Value(..) => Err(err("expected unit variant")),
+        }
+    }
+
+    fn newtype_variant_seed<T: DeserializeSeed<'de>>(self, seed: T) -> Result<T::Value, Error> {
+        self.with_data("newtype", |de| seed.deserialize(de))
+    }
+
+    fn tuple_variant<V: Visitor<'de>>(self, _len: usize, visitor: V) -> Result<V::Value, Error> {
+        self.with_data("tuple", |de| de::Deserializer::deserialize_seq(de, visitor))
+    }
+
+    fn struct_variant<V: Visitor<'de>>(
+        self,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.with_data("struct", |de| {
+            de::Deserializer::deserialize_map(de, visitor)
+        })
+    }
+}
+
+/// Settings that apply to a whole document.
+///
+/// Grouped rather than passed one by one: they travel together to every nested
+/// deserialiser, and a positional list of three bools and an enum is one
+/// transposition away from a bug the type system cannot catch.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct StreamOptions {
+    /// Which schema decides scalar resolution.
+    pub(crate) version: YamlVersion,
+    /// Expand `<<` merge keys.
+    pub(crate) merge_keys: bool,
+    /// Reject a mapping that states the same scalar key twice.
+    pub(crate) strict: bool,
+}
+
+/// Deserialises the null document that an empty stream denotes.
+///
+/// `compose_one` treats an empty stream as a null document rather than an error,
+/// so streaming has to as well. Routed through a synthetic empty plain scalar
+/// instead of a separate null deserialiser, so it resolves by exactly the same
+/// rules as a null written in the document -- one code path, nothing to drift.
+pub(crate) fn deserialize_null_document<T: DeserializeOwned>(
+    options: StreamOptions,
+) -> Result<T, Error> {
+    let null = Event {
+        kind: EventKind::Scalar {
+            value: std::borrow::Cow::Borrowed(""),
+            style: ScalarStyle::Plain,
+            anchor: None,
+            tag: None,
+        },
+        span: Span::point(Position::start()),
+    };
+    let mut source = SliceSource::new(vec![null]);
+    let mut de = EventDeserializer::new(&mut source, options);
+    T::deserialize(&mut de)
+}
+
 /// What the next event is, without holding a borrow on the deserialiser.
 ///
 /// Returned by value on purpose: the caller consumes the event immediately
@@ -199,24 +350,17 @@ enum Peek {
 /// Deserialises the next value from a stream of parser events.
 pub(crate) struct EventDeserializer<'a, 'de, S: EventSource<'de>> {
     source: &'a mut S,
-    version: YamlVersion,
-    /// Expand `<<` merge keys. Off by default: strict YAML 1.2 has no merge key.
-    merge_keys: bool,
+    options: StreamOptions,
     /// One event of lookahead, so a collection can ask "is this my end?" without
     /// consuming an element it would then have to put back.
     peeked: Option<Event<'de>>,
 }
 
 impl<'a, 'de, S: EventSource<'de>> EventDeserializer<'a, 'de, S> {
-    // Reachable only from tests until #57 routes `from_str` through the
-    // streaming path. Scoped to the individual item rather than the module so
-    // anything that becomes dead LATER is still reported.
-    #[allow(dead_code)]
-    pub(crate) const fn new(source: &'a mut S, version: YamlVersion, merge_keys: bool) -> Self {
+    pub(crate) const fn new(source: &'a mut S, options: StreamOptions) -> Self {
         Self {
             source,
-            version,
-            merge_keys,
+            options,
             peeked: None,
         }
     }
@@ -259,13 +403,15 @@ impl<'a, 'de, S: EventSource<'de>> EventDeserializer<'a, 'de, S> {
 
     /// The text of the next event if it is a scalar.
     ///
-    /// Needed to spot a `<<` key and to record which keys the mapping states
-    /// explicitly, both of which have to happen before the key is handed to the
-    /// caller's seed and consumed.
-    fn peek_scalar_text(&mut self) -> Result<Option<&str>, Error> {
+    /// The span comes with it: a duplicate-key error names where the key was
+    /// FIRST seen, which is no longer available once the event is consumed.
+    ///
+    /// Needed before the key reaches the caller's seed, to spot a `<<` and to
+    /// record what the mapping states explicitly.
+    fn peek_scalar(&mut self) -> Result<Option<(&str, Span)>, Error> {
         self.fill()?;
         Ok(self.peeked.as_ref().and_then(|e| match &e.kind {
-            EventKind::Scalar { value, .. } => Some(&**value),
+            EventKind::Scalar { value, .. } => Some((&**value, e.span)),
             _ => None,
         }))
     }
@@ -297,19 +443,114 @@ impl<'a, 'de, S: EventSource<'de>> EventDeserializer<'a, 'de, S> {
     }
 
     /// Skips the stream and document framing the parser wraps a value in.
-    #[allow(dead_code)]
+    ///
+    /// A `%YAML 1.1` directive is picked up on the way past. The version is
+    /// carried on `DocumentStart` because it is document-scoped -- a scalar
+    /// alone cannot say which schema decides whether `no` is a boolean.
     pub(crate) fn skip_framing(&mut self) -> Result<(), Error> {
         while self.peek()? == Some(Peek::Framing) {
+            if let Some(event) = &self.peeked
+                && let EventKind::DocumentStart { version, .. } = event.kind
+                && version.is_1_1()
+            {
+                // Raised, never lowered: a caller who asked for 1.1 keeps it for
+                // a document that declares 1.2. `from_str_with` reads the same
+                // way -- either source alone is enough and neither turns the
+                // other off.
+                self.options.version = YamlVersion::V1_1;
+            }
             self.take()?;
         }
         Ok(())
     }
+
+    /// The settings in force, after any document directive was read.
+    pub(crate) const fn options(&self) -> StreamOptions {
+        self.options
+    }
+
+    /// Whether the next event is a plain null, which is what `None` looks like.
+    fn peek_is_plain_null(&mut self) -> Result<bool, Error> {
+        self.fill()?;
+        Ok(self.peeked.as_ref().is_some_and(|e| match &e.kind {
+            EventKind::Scalar { value, style, .. } => {
+                *style == ScalarStyle::Plain && glaucus_core::schema::is_null(value)
+            }
+            _ => false,
+        }))
+    }
+
+    /// Reads an enum in any of the three forms the tree path accepts.
+    fn deserialize_enum_value<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        // Captured whole so the shape can be inspected before it is committed
+        // to. A single-key mapping is only recognisable once its end is in hand.
+        let events = self.capture_value()?;
+        let options = self.options;
+
+        // `serde_yaml` drop-in: an externally-tagged non-unit variant may arrive
+        // as a YAML local tag on the data node, e.g. `!Variant\n- 1`. Accepted
+        // alongside the single-key mapping form.
+        if let Some(name) = variant_tag_of(&events) {
+            return visitor.visit_enum(EnumAccess {
+                variant: Variant::Tagged(name, events),
+                options,
+            });
+        }
+
+        match events.first().map(|e| &e.kind) {
+            // A plain scalar names a unit variant.
+            Some(EventKind::Scalar { .. }) => visitor.visit_enum(EnumAccess {
+                variant: Variant::Unit(events),
+                options,
+            }),
+            Some(EventKind::MappingStart { .. }) => {
+                let mut entries = VecDeque::new();
+                // `false`: a `<<` inside an enum mapping is the variant name, not
+                // a merge -- the tree path reaches this before merge folding too.
+                push_mapping_entries(&events, &mut entries, false)?;
+                match (entries.pop_front(), entries.is_empty()) {
+                    (Some((key, value)), true) => visitor.visit_enum(EnumAccess {
+                        variant: Variant::Keyed(key, value),
+                        options,
+                    }),
+                    _ => Err(err("expected a single-key mapping for enum variant")),
+                }
+            }
+            _ => Err(err("expected a scalar or mapping for enum, found sequence")),
+        }
+    }
+
+    /// Whether the stream has nothing left to deserialise.
+    pub(crate) fn at_end(&mut self) -> Result<bool, Error> {
+        Ok(self.peek()?.is_none())
+    }
 }
 
-impl<'de, S: EventSource<'de>> de::Deserializer<'de> for &mut EventDeserializer<'_, 'de, S> {
-    type Error = Error;
+/// Forwards a typed request to the scalar deserialiser of the same name.
+///
+/// Collapsing these into `deserialize_any` instead would lose every
+/// type-directed decision: `deserialize_str` would resolve `123` to an integer
+/// and fail a `String` target, and `deserialize_bool` would report serde's
+/// generic "invalid type" rather than saying which value was not a boolean.
+macro_rules! forward_to_scalar {
+    ($($method:ident),* $(,)?) => {
+        $(
+            fn $method<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+                self.dispatch(visitor, |scalar, v| {
+                    de::Deserializer::$method(scalar, v)
+                })
+            }
+        )*
+    };
+}
 
-    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+impl<'de, S: EventSource<'de>> EventDeserializer<'_, 'de, S> {
+    /// Takes the next value and routes it: scalars to `f`, collections to serde.
+    fn dispatch<V, F>(&mut self, visitor: V, f: F) -> Result<V::Value, Error>
+    where
+        V: Visitor<'de>,
+        F: FnOnce(ScalarDeserializer<'de>, V) -> Result<V::Value, Error>,
+    {
         let Some(event) = self.take()? else {
             return Err(err("unexpected end of input: expected a value"));
         };
@@ -322,7 +563,7 @@ impl<'de, S: EventSource<'de>> de::Deserializer<'de> for &mut EventDeserializer<
             #[rustfmt::skip]
             EventKind::Scalar { value, style, anchor: _, tag } => {
                 let tag = tag.map(|(handle, suffix)| Tag::resolve(handle, suffix, span));
-                ScalarDeserializer::new(value, style, tag, self.version).deserialize_any(visitor)
+                f(ScalarDeserializer::new(value, style, tag, self.options.version), visitor)
             }
             EventKind::SequenceStart { .. } => visitor.visit_seq(SeqAccess { de: self }),
             EventKind::MappingStart { .. } => visitor.visit_map(MapAccess::new(self)),
@@ -330,10 +571,150 @@ impl<'de, S: EventSource<'de>> de::Deserializer<'de> for &mut EventDeserializer<
         }
     }
 
-    serde::forward_to_deserialize_any! {
-        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
-        bytes byte_buf option unit unit_struct newtype_struct seq tuple
-        tuple_struct map struct enum identifier ignored_any
+    /// Drives a sequence, refusing anything else.
+    fn expect_seq<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match self.take()?.map(|e| e.kind) {
+            Some(EventKind::SequenceStart { .. }) => visitor.visit_seq(SeqAccess { de: self }),
+            _ => Err(err("expected a sequence")),
+        }
+    }
+
+    /// Drives a mapping, refusing anything else.
+    fn expect_map<V: Visitor<'de>>(&mut self, visitor: V) -> Result<V::Value, Error> {
+        match self.take()?.map(|e| e.kind) {
+            Some(EventKind::MappingStart { .. }) => visitor.visit_map(MapAccess::new(self)),
+            _ => Err(err("expected a mapping")),
+        }
+    }
+
+    /// Discards the next value without building anything from it.
+    ///
+    /// The tree path can ignore a value by doing nothing, because the node was
+    /// already built and the caller simply walks past it. A stream has to be
+    /// consumed: leaving the events in place would desynchronise every entry
+    /// after the ignored one.
+    fn skip_value(&mut self) -> Result<(), Error> {
+        let mut depth = 0usize;
+        loop {
+            let Some(event) = self.take()? else {
+                return Err(err("unexpected end of input: value is incomplete"));
+            };
+            match event.kind {
+                EventKind::SequenceStart { .. } | EventKind::MappingStart { .. } => depth += 1,
+                EventKind::SequenceEnd | EventKind::MappingEnd => {
+                    depth = depth.saturating_sub(1);
+                }
+                _ => {}
+            }
+            if depth == 0 {
+                return Ok(());
+            }
+        }
+    }
+}
+
+impl<'de, S: EventSource<'de>> de::Deserializer<'de> for &mut EventDeserializer<'_, 'de, S> {
+    type Error = Error;
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.dispatch(visitor, de::Deserializer::deserialize_any)
+    }
+
+    forward_to_scalar! {
+        deserialize_bool,
+        deserialize_i8,
+        deserialize_i16,
+        deserialize_i32,
+        deserialize_i64,
+        deserialize_i128,
+        deserialize_u8,
+        deserialize_u16,
+        deserialize_u32,
+        deserialize_u64,
+        deserialize_u128,
+        deserialize_f32,
+        deserialize_f64,
+        deserialize_char,
+        deserialize_str,
+        deserialize_string,
+        deserialize_bytes,
+        deserialize_byte_buf,
+        deserialize_unit,
+        deserialize_identifier,
+    }
+
+    /// `None` only for a plain null; anything else is a present value.
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        if self.peek_is_plain_null()? {
+            self.take()?;
+            return visitor.visit_none();
+        }
+        visitor.visit_some(self)
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.deserialize_unit(visitor)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_seq(visitor)
+    }
+
+    fn deserialize_tuple<V: Visitor<'de>>(
+        self,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.expect_seq(visitor)
+    }
+
+    fn deserialize_tuple_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _len: usize,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.expect_seq(visitor)
+    }
+
+    fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.expect_map(visitor)
+    }
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.expect_map(visitor)
+    }
+
+    fn deserialize_enum<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        _variants: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.deserialize_enum_value(visitor)
+    }
+
+    /// Consumes the value and reports nothing about it.
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.skip_value()?;
+        visitor.visit_unit()
     }
 }
 
@@ -378,9 +759,12 @@ impl<'de, S: EventSource<'de>> de::SeqAccess<'de> for SeqAccess<'_, '_, 'de, S> 
 /// and an earlier source is already in `seen` by the time a later one is.
 struct MapAccess<'a, 'b, 'de, S: EventSource<'de>> {
     de: &'a mut EventDeserializer<'b, 'de, S>,
-    /// Scalar keys already emitted. Left empty when merge keys are off, so an
-    /// ordinary mapping does not pay for a feature it is not using.
-    seen: HashSet<String>,
+    /// Scalar keys already emitted, and where each was first seen.
+    ///
+    /// Serves two jobs: merge precedence, and duplicate detection in strict
+    /// mode. Left empty when neither is active, so a lenient mapping with no
+    /// merge key pays nothing.
+    seen: HashMap<String, Span>,
     /// Entries contributed by `<<`, flattened in source order.
     merged: VecDeque<(Vec<Event<'de>>, Vec<Event<'de>>)>,
     /// Value events for the merged entry whose key was just handed out.
@@ -393,7 +777,7 @@ impl<'a, 'b, 'de, S: EventSource<'de>> MapAccess<'a, 'b, 'de, S> {
     fn new(de: &'a mut EventDeserializer<'b, 'de, S>) -> Self {
         Self {
             de,
-            seen: HashSet::new(),
+            seen: HashMap::new(),
             merged: VecDeque::new(),
             pending: None,
             draining: false,
@@ -410,7 +794,10 @@ impl<'a, 'b, 'de, S: EventSource<'de>> MapAccess<'a, 'b, 'de, S> {
             // earlier sources before later ones, so one `insert` decides both
             // rules. A non-scalar key has no text to collide on and is kept.
             if let Some(text) = scalar_text(&key)
-                && !self.seen.insert(text.to_owned())
+                && self
+                    .seen
+                    .insert(text.to_owned(), Span::point(Position::start()))
+                    .is_some()
             {
                 continue;
             }
@@ -427,7 +814,7 @@ impl<'a, 'b, 'de, S: EventSource<'de>> MapAccess<'a, 'b, 'de, S> {
         seed: T,
     ) -> Result<T::Value, Error> {
         let mut source = SliceSource::new(events);
-        let mut de = EventDeserializer::new(&mut source, self.de.version, self.de.merge_keys);
+        let mut de = EventDeserializer::new(&mut source, self.de.options);
         seed.deserialize(&mut de)
     }
 }
@@ -463,25 +850,37 @@ impl<'de, S: EventSource<'de>> de::MapAccess<'de> for MapAccess<'_, '_, 'de, S> 
             }
 
             // Owned because the borrow has to end before the key is consumed.
-            // Only paid for when merge keys are on, which is opt-in.
-            let text = if self.de.merge_keys {
-                self.de.peek_scalar_text()?.map(str::to_owned)
+            // Nothing is read at all unless one of the two features needs it.
+            let key = if self.de.options.merge_keys || self.de.options.strict {
+                self.de
+                    .peek_scalar()?
+                    .map(|(text, span)| (text.to_owned(), span))
             } else {
                 None
             };
 
             // `Composer::is_merge_key` asks only for the scalar's text, so a
             // quoted `"<<"` merges too. Matching the reference matters more here
-            // than what the spec implies.
-            if text.as_deref() == Some("<<") {
+            // than what the spec implies. Checked before the duplicate rule, as
+            // in the composer: a mapping may carry several `<<` keys.
+            if key.as_ref().is_some_and(|(text, _)| text == "<<") && self.de.options.merge_keys {
                 self.de.take()?;
                 let value = self.de.capture_value()?;
-                split_merge_sources(&value, &mut self.merged, self.de.merge_keys)?;
+                split_merge_sources(&value, &mut self.merged, self.de.options.merge_keys)?;
                 continue;
             }
 
-            if let Some(text) = text {
-                self.seen.insert(text);
+            if let Some((text, span)) = key {
+                // Only SCALAR keys are compared, as in the composer: two
+                // collection keys cannot collide by text.
+                if let Some(first) = self.seen.insert(text.clone(), span)
+                    && self.de.options.strict
+                {
+                    return Err(Error::core(glaucus_core::error::Error::new(
+                        glaucus_core::error::ErrorKind::DuplicateKey { key: text, first },
+                        span,
+                    )));
+                }
             }
             return seed.deserialize(&mut *self.de).map(Some);
         }
@@ -512,10 +911,35 @@ mod tests {
 
     use super::*;
 
+    /// Deserialises through the `Node` tree.
+    ///
+    /// Spelled out rather than calling `from_str`, which since #57 streams --
+    /// calling it here would compare the streaming path with itself and every
+    /// agreement test below would pass while proving nothing.
+    fn via_tree<T: DeserializeOwned>(
+        yaml: &str,
+        config: glaucus_core::error::ParserConfig,
+    ) -> Result<T, Error> {
+        let yaml_1_1 = config.yaml_1_1;
+        let (node, version) =
+            glaucus_ast::composer::compose_one_versioned(yaml, config).map_err(Error::core)?;
+        let mut de = crate::de::Deserializer::from_node_with(&node, yaml_1_1 || version.is_1_1());
+        T::deserialize(&mut de)
+    }
+
+    /// Options for a test: 1.2 resolution, strict, merges as asked.
+    const fn opts(merge_keys: bool) -> StreamOptions {
+        StreamOptions {
+            version: YamlVersion::V1_2,
+            merge_keys,
+            strict: true,
+        }
+    }
+
     /// Deserialises `input` by driving the real parser through a [`Tape`].
     fn from_yaml<'de, T: Deserialize<'de>>(input: &'de str) -> Result<T, Error> {
         let mut tape = Tape::new(input);
-        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, false);
+        let mut de = EventDeserializer::new(&mut tape, opts(false));
         de.skip_framing()?;
         T::deserialize(&mut de)
     }
@@ -630,7 +1054,7 @@ mod tests {
     /// Deserialises `T` from injected events.
     fn from_events<'de, T: Deserialize<'de>>(events: Vec<Event<'de>>) -> Result<T, Error> {
         let mut source = SliceSource::new(events);
-        let mut de = EventDeserializer::new(&mut source, YamlVersion::V1_2, false);
+        let mut de = EventDeserializer::new(&mut source, opts(false));
         T::deserialize(&mut de)
     }
 
@@ -699,7 +1123,7 @@ mod tests {
     #[test]
     fn skip_framing_stops_at_the_first_real_value() {
         let mut tape = Tape::new("- 1\n");
-        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, false);
+        let mut de = EventDeserializer::new(&mut tape, opts(false));
         de.skip_framing().unwrap();
         assert_eq!(de.peek().unwrap(), Some(Peek::Value));
     }
@@ -707,7 +1131,7 @@ mod tests {
     #[test]
     fn skip_framing_on_an_empty_document_reaches_the_end() {
         let mut tape = Tape::new("");
-        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, false);
+        let mut de = EventDeserializer::new(&mut tape, opts(false));
         de.skip_framing().unwrap();
         assert_eq!(de.peek().unwrap(), None);
     }
@@ -728,7 +1152,7 @@ mod tests {
             at(EventKind::DocumentEnd { explicit: true }),
             at(EventKind::StreamEnd),
         ]);
-        let mut de = EventDeserializer::new(&mut source, YamlVersion::V1_2, false);
+        let mut de = EventDeserializer::new(&mut source, opts(false));
 
         de.skip_framing().unwrap();
         assert_eq!(i64::deserialize(&mut de).unwrap(), 7);
@@ -881,7 +1305,8 @@ mod tests {
 
         let mut disagreements = Vec::new();
         for yaml in CASES {
-            let tree = crate::from_str::<Shape>(yaml).map_err(|e| e.to_string());
+            let tree = via_tree::<Shape>(yaml, glaucus_core::error::ParserConfig::default())
+                .map_err(|e| e.to_string());
             let streaming = from_yaml::<Shape>(yaml).map_err(|e| e.to_string());
 
             match (&tree, &streaming) {
@@ -917,7 +1342,7 @@ mod tests {
     /// Deserialises with `<<` merge-key expansion enabled.
     fn from_yaml_merged<'de, T: Deserialize<'de>>(input: &'de str) -> Result<T, Error> {
         let mut tape = Tape::new(input);
-        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, true);
+        let mut de = EventDeserializer::new(&mut tape, opts(true));
         de.skip_framing()?;
         T::deserialize(&mut de)
     }
@@ -1053,8 +1478,7 @@ mod tests {
 
         let mut disagreements = Vec::new();
         for yaml in CASES {
-            let tree =
-                crate::from_str_with::<Shape>(yaml, config.clone()).map_err(|e| e.to_string());
+            let tree = via_tree::<Shape>(yaml, config.clone()).map_err(|e| e.to_string());
             let streaming = from_yaml_merged::<Shape>(yaml).map_err(|e| e.to_string());
 
             match (&tree, &streaming) {
@@ -1131,7 +1555,7 @@ mod tests {
         // Reachable only from an injected stream: the parser raises its own
         // error at end of input before a value can simply stop.
         let mut source = SliceSource::new(vec![map_start(), scalar("a")]);
-        let mut de = EventDeserializer::new(&mut source, YamlVersion::V1_2, true);
+        let mut de = EventDeserializer::new(&mut source, opts(true));
         let msg = de
             .capture_value()
             .expect_err("an unterminated merge value was captured")
@@ -1178,7 +1602,7 @@ mod tests {
             ..Default::default()
         };
         (
-            crate::from_str_with::<Entries>(yaml, config).map_err(|e| e.to_string()),
+            via_tree::<Entries>(yaml, config).map_err(|e| e.to_string()),
             from_yaml_merged::<Entries>(yaml).map_err(|e| e.to_string()),
         )
     }
@@ -1229,7 +1653,7 @@ mod tests {
     ) -> Result<T, Error> {
         let merge_keys = config.merge_keys;
         let mut tape = Tape::with_config(input, config);
-        let mut de = EventDeserializer::new(&mut tape, YamlVersion::V1_2, merge_keys);
+        let mut de = EventDeserializer::new(&mut tape, opts(merge_keys));
         de.skip_framing()?;
         T::deserialize(&mut de)
     }
@@ -1310,7 +1734,7 @@ mod tests {
 
         let mut disagreements = Vec::new();
         for (yaml, config) in cases {
-            let tree = crate::from_str_with::<Shape>(yaml, config.clone()).is_ok();
+            let tree = via_tree::<Shape>(yaml, config.clone()).is_ok();
             let streaming = from_yaml_with::<Shape>(yaml, config.clone()).is_ok();
             if tree != streaming {
                 disagreements.push(format!(
@@ -1357,7 +1781,7 @@ mod tests {
         };
         let yaml = "a: &a [[1]]\nb: [[*a]]\n";
         assert!(
-            crate::from_str_with::<Shape>(yaml, deep.clone()).is_ok(),
+            via_tree::<Shape>(yaml, deep.clone()).is_ok(),
             "the tree path is expected to accept this today"
         );
         assert!(
@@ -1381,12 +1805,131 @@ mod tests {
             "e: [*d,*d,*d,*d,*d,*d,*d,*d,*d]\n",
         );
         assert!(
-            crate::from_str_with::<Shape>(bomb, ParserConfig::default()).is_ok(),
+            via_tree::<Shape>(bomb, ParserConfig::default()).is_ok(),
             "the tree path is expected to accept this today"
         );
         assert!(
             from_yaml_with::<Shape>(bomb, ParserConfig::default()).is_err(),
             "streaming must refuse a billion-laughs document"
         );
+    }
+
+    // --- typed dispatch (#57) ----------------------------------------------
+
+    #[test]
+    fn a_shape_mismatch_names_what_was_expected() {
+        // `deserialize_seq` and `deserialize_map` check the EVENT, rather than
+        // resolving a scalar and letting serde report a generic type error.
+        let msg = from_yaml::<Vec<i64>>("a: 1\n")
+            .expect_err("a mapping satisfied a sequence target")
+            .to_string();
+        assert!(msg.contains("expected a sequence"), "{msg}");
+
+        let msg = from_yaml::<BTreeMap<String, i64>>("[1]\n")
+            .expect_err("a sequence satisfied a mapping target")
+            .to_string();
+        assert!(msg.contains("expected a mapping"), "{msg}");
+    }
+
+    #[test]
+    fn a_collection_target_on_an_empty_stream_is_an_error() {
+        let mut source = SliceSource::new(vec![]);
+        let mut de = EventDeserializer::new(&mut source, opts(false));
+        let msg = Vec::<i64>::deserialize(&mut de)
+            .expect_err("an empty stream satisfied a sequence target")
+            .to_string();
+        assert!(msg.contains("expected a sequence"), "{msg}");
+    }
+
+    #[test]
+    fn option_is_none_only_for_a_plain_null() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            a: Option<Vec<i64>>,
+            b: Option<i64>,
+        }
+
+        // A sequence is a present value, so the null peek has to look past
+        // "is there a scalar here" and say no.
+        let got: Doc = from_yaml("a: [1]\nb: ~\n").unwrap();
+        assert_eq!(
+            got,
+            Doc {
+                a: Some(vec![1]),
+                b: None,
+            }
+        );
+    }
+
+    #[test]
+    fn an_ignored_value_is_consumed_not_skipped_over() {
+        // The tree path can ignore a field by doing nothing: the node is already
+        // built. A stream must CONSUME it, or every entry after the ignored one
+        // reads the wrong events.
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Doc {
+            keep: i64,
+        }
+
+        let got: Doc = from_yaml("drop: {a: [1, 2], b: {c: 3}}\nkeep: 7\n").unwrap();
+        assert_eq!(
+            got.keep, 7,
+            "the field after an ignored one must still line up"
+        );
+    }
+
+    #[test]
+    fn an_ignored_value_that_never_ends_is_an_error() {
+        let mut source = SliceSource::new(vec![seq_start(), scalar("1")]);
+        let mut de = EventDeserializer::new(&mut source, opts(false));
+        let msg = de::IgnoredAny::deserialize(&mut de)
+            .expect_err("an unterminated value was skipped")
+            .to_string();
+        assert!(msg.contains("value is incomplete"), "{msg}");
+    }
+
+    #[test]
+    fn enums_arrive_in_all_three_forms() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        enum E {
+            Unit,
+            Newtype(i64),
+            Struct { a: i64 },
+        }
+
+        assert_eq!(from_yaml::<E>("Unit\n").unwrap(), E::Unit);
+        assert_eq!(from_yaml::<E>("Newtype: 7\n").unwrap(), E::Newtype(7));
+        assert_eq!(
+            from_yaml::<E>("Struct:\n  a: 1\n").unwrap(),
+            E::Struct { a: 1 }
+        );
+        // The `serde_yaml` drop-in form: a local tag names the variant.
+        assert_eq!(from_yaml::<E>("!Newtype 7\n").unwrap(), E::Newtype(7));
+    }
+
+    #[test]
+    fn a_mapping_with_more_than_one_key_is_not_an_enum_variant() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        enum E {
+            A(i64),
+        }
+
+        let msg = from_yaml::<E>("A: 1\nB: 2\n")
+            .expect_err("a two-key mapping named a variant")
+            .to_string();
+        assert!(msg.contains("single-key mapping"), "{msg}");
+
+        let msg = from_yaml::<E>("[1]\n")
+            .expect_err("a sequence named a variant")
+            .to_string();
+        assert!(msg.contains("enum"), "{msg}");
+    }
+
+    #[test]
+    fn variant_tag_of_ignores_events_that_cannot_carry_one() {
+        // Only three event kinds have a tag field. Reached through the
+        // deserialiser only on a well-formed value, so it is asked directly.
+        assert_eq!(variant_tag_of(&[at(EventKind::StreamEnd)]), None);
+        assert_eq!(variant_tag_of(&[]), None);
     }
 }

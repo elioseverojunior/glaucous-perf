@@ -82,15 +82,26 @@ struct Case {
 }
 
 /// Deserialises through the `Node` tree: compose, then walk the tree.
+///
+/// Spelled out rather than calling `from_str`, which since #57 streams. This is
+/// exactly what `from_str` used to do, version directive included -- reading the
+/// directive matters, or a `%YAML 1.1` document would report a difference that
+/// is an artefact of the harness rather than of the engines.
 fn via_tree(yaml: &str) -> Result<Shape, String> {
-    from_str::<Shape>(yaml).map_err(|e| e.to_string())
+    let (node, version) = glaucus_ast::composer::compose_one_versioned(
+        yaml,
+        glaucus_core::error::ParserConfig::default(),
+    )
+    .map_err(|e| e.to_string())?;
+    let mut de = glaucus_serde::de::Deserializer::from_node_with(&node, version.is_1_1());
+    Shape::deserialize(&mut de).map_err(|e| e.to_string())
 }
 
 /// Deserialises through the parser event stream, without composing a tree.
 ///
-/// Identical to [`via_tree`] until #57. Kept as a separate function so the switch
-/// is a one-line change here rather than a rewrite of the harness, and so the
-/// corpus is already green when the second engine arrives.
+/// Since #57 this is what `from_str` does for every target that is not `Value`,
+/// so the two helpers now exercise genuinely different engines and the corpus
+/// finally means something.
 fn via_streaming(yaml: &str) -> Result<Shape, String> {
     from_str::<Shape>(yaml).map_err(|e| e.to_string())
 }

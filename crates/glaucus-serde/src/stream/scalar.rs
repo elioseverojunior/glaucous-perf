@@ -65,6 +65,26 @@ impl<'de> ScalarDeserializer<'de> {
     }
 }
 
+impl ScalarDeserializer<'_> {
+    /// The value as an integer, or the error the wide method would give.
+    fn int(&self) -> Result<i64, Error> {
+        glaucus_core::schema::resolve_int(&self.value)
+            .ok_or_else(|| err(format!("expected integer, found `{}`", self.value)))
+    }
+
+    /// The value as an unsigned integer.
+    fn uint(&self) -> Result<u64, Error> {
+        glaucus_core::schema::resolve_uint(&self.value)
+            .ok_or_else(|| err(format!("expected unsigned, found `{}`", self.value)))
+    }
+
+    /// The value as a float.
+    fn float(&self) -> Result<f64, Error> {
+        glaucus_core::schema::resolve_float(&self.value)
+            .ok_or_else(|| err(format!("expected float, found `{}`", self.value)))
+    }
+}
+
 impl<'de> de::Deserializer<'de> for ScalarDeserializer<'de> {
     type Error = Error;
 
@@ -113,24 +133,15 @@ impl<'de> de::Deserializer<'de> for ScalarDeserializer<'de> {
     }
 
     fn deserialize_i64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        glaucus_core::schema::resolve_int(&self.value).map_or_else(
-            || Err(err(format!("expected integer, found `{}`", self.value))),
-            |i| visitor.visit_i64(i),
-        )
+        visitor.visit_i64(self.int()?)
     }
 
     fn deserialize_u64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        glaucus_core::schema::resolve_uint(&self.value).map_or_else(
-            || Err(err(format!("expected unsigned, found `{}`", self.value))),
-            |u| visitor.visit_u64(u),
-        )
+        visitor.visit_u64(self.uint()?)
     }
 
     fn deserialize_f64<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
-        glaucus_core::schema::resolve_float(&self.value).map_or_else(
-            || Err(err(format!("expected float, found `{}`", self.value))),
-            |f| visitor.visit_f64(f),
-        )
+        visitor.visit_f64(self.float()?)
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
@@ -147,10 +158,111 @@ impl<'de> de::Deserializer<'de> for ScalarDeserializer<'de> {
         Err(err("expected null"))
     }
 
+    // The narrow integer types resolve exactly as the wide ones do and then
+    // narrow, so a value that does not fit reports the overflow rather than
+    // being silently truncated.
+    fn deserialize_i8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let i = self.int()?;
+        visitor.visit_i8(i.try_into().map_err(|_| err(format!("{i} overflows i8")))?)
+    }
+
+    fn deserialize_i16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let i = self.int()?;
+        visitor.visit_i16(
+            i.try_into()
+                .map_err(|_| err(format!("{i} overflows i16")))?,
+        )
+    }
+
+    fn deserialize_i32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let i = self.int()?;
+        visitor.visit_i32(
+            i.try_into()
+                .map_err(|_| err(format!("{i} overflows i32")))?,
+        )
+    }
+
+    fn deserialize_u8<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let u = self.uint()?;
+        visitor.visit_u8(u.try_into().map_err(|_| err(format!("{u} overflows u8")))?)
+    }
+
+    fn deserialize_u16<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let u = self.uint()?;
+        visitor.visit_u16(
+            u.try_into()
+                .map_err(|_| err(format!("{u} overflows u16")))?,
+        )
+    }
+
+    fn deserialize_u32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let u = self.uint()?;
+        visitor.visit_u32(
+            u.try_into()
+                .map_err(|_| err(format!("{u} overflows u32")))?,
+        )
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn deserialize_f32<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        // YAML has one float type; narrowing to the `f32` the caller asked for
+        // is the whole point of this method, and matches what serde_json does.
+        visitor.visit_f32(self.float()? as f32)
+    }
+
+    fn deserialize_char<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        let mut chars = self.value.chars();
+        let c = chars
+            .next()
+            .ok_or_else(|| err("expected a character, found empty string"))?;
+        if chars.next().is_some() {
+            return Err(err(format!(
+                "expected a single character, found `{}`",
+                self.value
+            )));
+        }
+        visitor.visit_char(c)
+    }
+
+    fn deserialize_bytes<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        // `!!binary` is base64 in the source and bytes in the data model, so a
+        // bytes-shaped target must get the decoded payload rather than the
+        // encoding. Untagged scalars keep passing their UTF-8 through unchanged.
+        if self.core_tag() == Some(CoreTag::Binary) {
+            return visit_core_tagged_value(CoreTag::Binary, &self.value, self.version, visitor);
+        }
+        visitor.visit_bytes(self.value.as_bytes())
+    }
+
+    fn deserialize_byte_buf<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.deserialize_bytes(visitor)
+    }
+
+    fn deserialize_unit_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        self.deserialize_unit(visitor)
+    }
+
+    fn deserialize_newtype_struct<V: Visitor<'de>>(
+        self,
+        _name: &'static str,
+        visitor: V,
+    ) -> Result<V::Value, Error> {
+        visitor.visit_newtype_struct(self)
+    }
+
+    fn deserialize_identifier<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
+        self.deserialize_str(visitor)
+    }
+
+    // Collections and enums never reach here: `EventDeserializer` inspects the
+    // event kind first and only builds a `ScalarDeserializer` for a scalar, so a
+    // sequence-shaped request against a scalar is refused before this point.
     serde::forward_to_deserialize_any! {
-        i8 i16 i32 i128 u8 u16 u32 u128 f32 char bytes byte_buf
-        unit_struct newtype_struct seq tuple tuple_struct map struct
-        enum identifier ignored_any
+        i128 u128 seq tuple tuple_struct map struct enum ignored_any
     }
 }
 
@@ -445,5 +557,62 @@ mod tests {
             .expect_err("non-float text deserialized as f64")
             .to_string();
         assert!(msg.contains("expected float, found `abc`"), "{msg}");
+    }
+
+    // --- reachable only by direct use --------------------------------------
+    //
+    // `EventDeserializer` handles unit structs and newtype structs itself, and
+    // only builds a `ScalarDeserializer` for a scalar. These stay implemented so
+    // this remains a correct standalone `Deserializer`, and are called directly
+    // so that claim is tested rather than assumed.
+
+    #[test]
+    fn an_untagged_scalar_hands_bytes_through_unchanged() {
+        // Only `!!binary` is decoded; anything else is its own UTF-8. Reached
+        // whenever a bytes-shaped target meets an ordinary scalar.
+        #[derive(Debug, PartialEq)]
+        struct Bytes(Vec<u8>);
+
+        impl<'de> Deserialize<'de> for Bytes {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct Visit;
+
+                impl serde::de::Visitor<'_> for Visit {
+                    type Value = Bytes;
+
+                    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        f.write_str("bytes")
+                    }
+
+                    fn visit_bytes<E>(self, v: &[u8]) -> Result<Bytes, E> {
+                        Ok(Bytes(v.to_vec()))
+                    }
+                }
+
+                d.deserialize_bytes(Visit)
+            }
+        }
+
+        assert_eq!(
+            Bytes::deserialize(plain("abc")).unwrap(),
+            Bytes(b"abc".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_unit_struct_requires_a_plain_null() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Unit;
+
+        assert_eq!(Unit::deserialize(plain("~")).unwrap(), Unit);
+        assert!(Unit::deserialize(plain("1")).is_err());
+    }
+
+    #[test]
+    fn a_newtype_struct_wraps_the_scalar() {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Wrapper(i64);
+
+        assert_eq!(Wrapper::deserialize(plain("7")).unwrap(), Wrapper(7));
     }
 }

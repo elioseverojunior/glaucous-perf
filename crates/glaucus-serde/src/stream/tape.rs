@@ -33,7 +33,6 @@ fn declared_anchor<'e>(event: &'e Event<'_>) -> Option<&'e str> {
 }
 
 /// Parser events, with the ability to replay an anchored span.
-#[allow(dead_code)]
 pub(crate) struct Tape<'a> {
     parser: Parser<'a>,
     /// Every recorded event, in one flat buffer.
@@ -91,9 +90,13 @@ pub(crate) struct Tape<'a> {
     limits: ResourceLimits,
 }
 
-#[allow(dead_code)]
 impl<'a> Tape<'a> {
     /// Creates a tape over `input` with default parser configuration.
+    // Test-only since #57: production reaches the tape through `with_config`,
+    // and resolves aliases inside `next` rather than replaying spans by hand.
+    // `cfg(test)` rather than an allow, so the compiler keeps enforcing that
+    // nothing in production quietly starts depending on it.
+    #[cfg(test)]
     pub(crate) fn new(input: &'a str) -> Self {
         Self::with_config(input, ParserConfig::default())
     }
@@ -353,7 +356,7 @@ impl<'a> Tape<'a> {
     /// `None` rather than a panic: an undefined alias is a defect in the
     /// *document*, which arrives from outside, so it must be an error the caller
     /// can report rather than a crash.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn replay(&self, name: &str) -> Option<&[Event<'a>]> {
         let range = self.anchors.get(name)?;
         self.buffer.get(range.clone())
@@ -364,6 +367,7 @@ impl<'a> Tape<'a> {
     /// Exists for the test that pins the anchor-free path at zero. That is a
     /// performance requirement of #49 — "no allocation on the anchor-free path" —
     /// and an untested performance requirement is an aspiration.
+    #[cfg(test)]
     pub(crate) const fn buffered_events(&self) -> usize {
         self.buffer.len()
     }
