@@ -1941,6 +1941,124 @@ flag "-t --threshold <threshold>" help="Coverage threshold" default="100" env="R
 arg "[args]" var=#true help="Extra arguments forwarded to cargo-tarpaulin (e.g. --out Html)"
 '''
 
+# The MSRV gate, runnable locally. `test:all` measures coverage and conformance
+# on the PINNED toolchain -- the one this repo is developed with -- so it can
+# never disagree with the floor Cargo.toml advertises to consumers. This task
+# runs at the floor instead, which is the only way that promise gets tested
+# before a release makes it public.
+#
+# Deliberately NOT tarpaulin and NOT the conformance harness, despite the
+# `test:all:` prefix. Both live in `publish = false` crates whose dev-only
+# dependency graphs set their own, much higher floors (tarpaulin's llvm engine
+# alone wants a newer toolchain), and a gate that fails because a coverage tool
+# moved on reports nothing about the MSRV. What IS meaningful at the floor is
+# every crate a consumer can install from crates.io: compile them, then run
+# their suites.
+#
+# .github/workflows/performance.yml's `msrv` job holds the same logic and cannot
+# call this task -- it deliberately skips setup-rust-env (which is what puts
+# mise on PATH) because provisioning the dev toolchain AT the floor fails on the
+# first tool that requires a newer rustc. Both halves read Cargo.toml, so
+# neither hardcodes the number and they cannot drift apart on the thing that
+# matters.
+[tasks."test:all:msrv"]
+alias = []
+description = "Compile and test every PUBLISHABLE crate at the declared MSRV (Cargo.toml `rust-version`), the floor consumers are promised; --check-only stops after the compile gate"
+run = '''
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+if [ "${usage_verbose:-false}" = "true" ]; then set -x; fi
+
+# Expanded with the `+` form, not a length test: an array-length expansion
+# opens a Tera comment in a mise run block and fails to render.
+eval "args=(${usage_args:-})"
+
+cd "$(git rev-parse --show-toplevel)"
+
+# READ the floor; never hardcode it. A literal version here would be a second
+# source of truth free to disagree with Cargo.toml -- the same class of bug this
+# task exists to catch, just relocated into the task runner.
+msrv="$(sed -n 's/^rust-version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)"
+if [ -z "$msrv" ]; then
+    echo "test:all:msrv: no rust-version in Cargo.toml [workspace.package]" >&2
+    exit 1
+fi
+
+# Two files declare the floor to two different tools and they have to agree.
+# Cargo.toml's `rust-version` is the promise to consumers and what this task
+# compiles against; .clippy.toml's `msrv` is what makes clippy REJECT an API
+# newer than the floor even though the pinned toolchain offers it. A missing
+# `msrv` is failed too, not tolerated: dropping the key silently switches clippy
+# back to assuming the pinned toolchain.
+clippy_msrv="$(sed -n 's/^msrv[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' .clippy.toml | head -n1)"
+if [ -z "$clippy_msrv" ]; then
+    echo "test:all:msrv: .clippy.toml has no msrv key; it must declare msrv = \"${msrv}\"" >&2
+    exit 1
+fi
+if [ "$clippy_msrv" != "$msrv" ]; then
+    echo "test:all:msrv: .clippy.toml msrv \"${clippy_msrv}\" disagrees with Cargo.toml rust-version \"${msrv}\"" >&2
+    exit 1
+fi
+
+echo "Declared MSRV: ${msrv} (Cargo.toml and .clippy.toml agree)"
+
+# Idempotent: prints "already installed" and exits 0 when it is. `minimal`
+# because nothing here needs clippy, rustfmt or the 902 MB of rust-docs.
+rustup toolchain install "$msrv" --profile minimal --no-self-update
+
+# Derive the crate list instead of maintaining an exclude list: cargo reports
+# `publish` as [] for `publish = false` and null when publishing is allowed, so
+# this selects exactly what a consumer can install from crates.io -- and a crate
+# added tomorrow is covered the day it lands rather than escaping until someone
+# notices.
+names="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages[] | select(.publish != []) | .name' | sort)"
+if [ -z "$names" ]; then
+    echo "test:all:msrv: no publishable crates resolved; refusing to pass vacuously" >&2
+    exit 1
+fi
+packages=()
+while IFS= read -r name; do
+    packages+=(--package "$name")
+done <<< "$names"
+
+# Selects the toolchain installed above for every cargo/rustc call below; it
+# outranks rust-toolchain.toml. This is the override that makes the task mean
+# anything.
+export RUSTUP_TOOLCHAIN="$msrv"
+
+# REQUIRED, not tidiness. .cargo/config.toml's per-target `rustflags` carry the
+# `-D warnings` policy AND a linker choice (mold on x86_64 Linux). A RUSTFLAGS
+# env var REPLACES that list rather than merging into it, so naming the flag
+# here keeps the warning policy byte-for-byte while dropping a linker that a
+# minimal floor toolchain has no reason to have. Warnings stay denied AT THE
+# FLOOR because the `lint` gate cannot cover it: that runs on the pinned
+# toolchain, so a lint that fires at the floor but was renamed by the pin goes
+# unseen.
+export RUSTFLAGS="-D warnings"
+
+echo "Using $(rustc --version)"
+echo "$names" | sed 's/^/  crate: /'
+
+# `--all-features` because the floor has to hold for every feature a consumer
+# can switch on; a default-only run would let an optional dependency raise the
+# real MSRV without ever failing here.
+cargo check --locked --all-features "${packages[@]}"
+
+if [ "${usage_check_only:-false}" = "true" ]; then
+    echo "test:all:msrv: --check-only, stopping after the compile gate"
+    exit 0
+fi
+
+cargo test --locked --all-features "${packages[@]}" ${args[@]+"${args[@]}"}
+'''
+shell = "bash -c"
+usage = '''
+flag "--check-only" help="Stop after the compile gate; do not run the suites at the floor"
+flag "-v --verbose" help="Trace each command before running it (set -x)"
+arg "[args]" var=#true help="Extra arguments forwarded to cargo test (e.g. -- --nocapture)"
+'''
+
 [tasks.codecov]
 alias = []
 depends = ["coverage"]
