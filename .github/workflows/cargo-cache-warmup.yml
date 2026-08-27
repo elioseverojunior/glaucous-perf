@@ -1,0 +1,110 @@
+name: Cargo Cache Warmup
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: false
+
+on:
+  schedule:
+    # Run daily at midnight UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch: # Allow manual triggering
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
+
+permissions:
+  contents: read
+  id-token: write
+  pages: write
+  pull-requests: write
+
+jobs:
+  warmup-cache:
+    name: Warm up Cargo cache (${{ matrix.os }} / ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # AMD64/x86_64 platforms
+          - os: ubuntu-latest
+            arch: x86_64
+            rust-target: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            arch: x86_64
+            rust-target: x86_64-pc-windows-msvc
+          - os: macos-26
+            arch: x86_64
+            rust-target: x86_64-apple-darwin
+          # ARM64/aarch64 platforms
+          - os: ubuntu-latest
+            arch: aarch64
+            rust-target: aarch64-unknown-linux-gnu
+          - os: macos-26
+            arch: aarch64
+            rust-target: aarch64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: "0"
+          fetch-tags: true
+          submodules: true
+
+      # Warms the rust AND mise caches for `lint` and `msrv`. The
+      # `cargo-binstall failed` lines it emits are a fallback notice, not a
+      # failure: those crates publish no prebuilt binary, so mise source-builds
+      # them here once per mise.lock change and later jobs restore the cache.
+      - name: Setup Environment
+        id: setup-rust-env
+        uses: ./.github/actions/setup-rust-env
+
+      - name: Download dependencies
+        run: cargo fetch
+
+      - name: Build project
+        run: cargo build --target ${{ matrix.rust-target }} --all-features
+
+      - name: Build tests
+        run: cargo test --target ${{ matrix.rust-target }} --no-run --all-features
+
+      - name: Build benchmarks
+        run: cargo bench --target ${{ matrix.rust-target }} --no-run --all-features || true
+
+      - name: Build documentation
+        run: cargo doc --target ${{ matrix.rust-target }} --no-deps --all-features
+
+      - name: Run clippy
+        run: cargo clippy --target ${{ matrix.rust-target }} --all-features --all-targets -- -D warnings || true
+
+      - name: Check formatting
+        run: cargo fmt -- --check || true
+
+      - name: Build with nextest
+        if: matrix.arch == 'x86_64' # Only run on native architectures
+        run: cargo nextest run --target ${{ matrix.rust-target }} --no-run --all-features || true
+        continue-on-error: true
+
+      - name: Summary
+        run: |
+          echo "## Cache Warmup Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Platform:** ${{ matrix.os }} / ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ matrix.rust-target }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Cargo registry cached" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Dependencies downloaded" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Project built for target ${{ matrix.rust-target }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Tests compiled" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Documentation generated" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Cache size details:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          du -sh ~/.cargo/registry/ 2>/dev/null || echo "Registry: N/A" >> $GITHUB_STEP_SUMMARY
+          du -sh ~/.cargo/git/ 2>/dev/null || echo "Git: N/A" >> $GITHUB_STEP_SUMMARY
+          du -sh target/ 2>/dev/null || echo "Target: N/A" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
