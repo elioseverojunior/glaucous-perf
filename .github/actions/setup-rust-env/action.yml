@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Elio Severo Junior <elioseverojunior@gmail.com>
+# SPDX-FileCopyrightText: Glaucus contributors
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -76,22 +76,162 @@ inputs:
     default: "false"
 
 outputs:
-  cache-hit:
-    description: "Whether the Rust cache was restored (exact match)"
-    value: ${{ steps.rust-toolchain.outputs.cache-hit }}
-  cache-key:
-    description: "The registry/build cache key rust-toolchain derived"
+  # Every output of elioseverojunior/rust-toolchain, forwarded verbatim under
+  # its own name, so the upstream reference applies to this composite 1:1:
+  # https://github.com/elioseverojunior/rust-toolchain/tree/2b4beb07b7a26e64b0e56c3540f61b9ea726a3e1/#outputs
+  #
+  # A composite passes on ONLY what it declares. Anything not listed here
+  # resolves to the empty string in the caller with no error and no warning --
+  # which is how performance.yml's Setup job came to forward twelve of these
+  # as empty values, and how `msrv` reached the MSRV job blank before it was
+  # added. Keep this list in step with the pinned rev above.
+
+  cachekey:
+    description: >
+      12-character cache key derived from rustc version date and commit hash,
+      compatible with dtolnay/rust-toolchain's cachekey output for seamless cache
+      interoperability.
     value: ${{ steps.rust-toolchain.outputs.cachekey }}
-  rust-version:
-    description: "The installed Rust toolchain version (e.g. 'rustc 1.88.0 (a1b2c3d4e 2025-07-14)')"
+
+  cachekey-full:
+    description: >
+      The cachekey above extended with a digest of the resolved channel, targets,
+      components and profile. Two jobs on the same compiler but with different
+      targets share a `cachekey` and would restore each other's artifacts; this
+      key keeps them apart. Targets and components are sorted, so writing the same
+      set in a different order still hits the same key.
+    value: ${{ steps.rust-toolchain.outputs.cachekey-full }}
+
+  cache:
+    description: >
+      The derived cache keys as one JSON object: `enabled`, plus a `layers` map
+      from layer name to `{ key, restoreKeys }` — and, once a layer has actually
+      been restored, `result` (`exact`, `partial` or `miss`). Empty when `cache`
+      is false. Read it with `fromJSON()`; a workflow wiring its own
+      `actions/cache` steps instead of relying on the lifecycle can feed the parts
+      straight in.
+    value: ${{ steps.rust-toolchain.outputs.cache }}
+
+  cache-hit:
+    description: >
+      `true` only when every enabled cache layer matched its exact key. A partial
+      match through a restore key counts as false, because the layer will be saved
+      again under the new key.
+    value: ${{ steps.rust-toolchain.outputs.cache-hit }}
+
+  name:
+    description: >
+      Resolved Rust toolchain channel name (e.g., stable, nightly-2025-01-01,
+      1.89.0).
     value: ${{ steps.rust-toolchain.outputs.name }}
+
+  toolchain:
+    description: >
+      The resolved channel, after merging `rust-toolchain.toml` with the inputs
+      and expanding any expressive form — `stable minus 2 releases` comes back as
+      the `1.NN` it became. Same value as `name`, which is kept under that name
+      for dtolnay/rust-toolchain compatibility.
+    value: ${{ steps.rust-toolchain.outputs.toolchain }}
+
+  targets:
+    description: >
+      The target triples actually installed, as a JSON array string (e.g.
+      `["wasm32-unknown-unknown","aarch64-apple-darwin"]`). A JSON array rather
+      than a delimited string so `fromJSON()` reads it directly and no consumer
+      has to guess the separator. Inputs lead the list, then any the toml added.
+    value: ${{ steps.rust-toolchain.outputs.targets }}
+
+  target:
+    description: >
+      The first entry of `targets`, for the common job that installs exactly one,
+      or an empty string when none were requested. Because inputs lead the merged
+      list, this is the caller's own target whenever they named one.
+    value: ${{ steps.rust-toolchain.outputs.target }}
+
+  components:
+    description: >
+      The components explicitly requested through the inputs or the toml, as a
+      JSON array string (e.g. `["clippy","rustfmt"]`). Components implied by the
+      profile are not listed here — those are best-effort and are not part of the
+      requested configuration.
+    value: ${{ steps.rust-toolchain.outputs.components }}
+
+  profile:
+    description: >
+      The resolved profile — `minimal`, `default` or `complete`. Always populated,
+      since an unset profile resolves to `default`.
+    value: ${{ steps.rust-toolchain.outputs.profile }}
+
   msrv:
     description: >
-      The `rust-version` declared by the root Cargo.toml, or an empty string.
-      Populated whether or not `msrv-install` ran, so a job can cross-check the
-      floor without paying for a second toolchain.
+      The `rust-version` declared by the workspace-root `Cargo.toml`, or an empty
+      string. The root manifest only, never a maximum over workspace members.
     value: ${{ steps.rust-toolchain.outputs.msrv }}
 
+  msrv-effective:
+    description: >
+      The highest `rust-version` across every package in the resolved dependency
+      graph, or an empty string. Resolved over every directory named by `cache-
+      workspaces`, not the root manifest only — unlike `msrv` below, which stays
+      root-only. Use this, not `msrv`, to choose a toolchain: the two differ
+      whenever a dependency outruns the crate's own declared floor. Empty under
+      `msrv-check: off`, since the check that computes it never ran — also empty
+      when the check ran but could not complete (no `Cargo.toml` in any directory,
+      no lockfile, or no package in the graph declares a `rust-version`), the same
+      as `off`. Build a matrix from this output only when `msrv-check` is `warn`
+      or `error`.
+    value: ${{ steps.rust-toolchain.outputs.msrv-effective }}
+
+  msrv-source:
+    description: >
+      Where `msrv` was read from — `cargo-toml`, `workspace-inherit`, or `none`.
+      `workspace-inherit` covers two shapes: a member that opted in with `rust-
+      version.workspace = true`, and a virtual manifest (no `[package]`), whose
+      `[workspace.package]` table is the declaration itself rather than something
+      inherited.
+    value: ${{ steps.rust-toolchain.outputs.msrv-source }}
+
+  set-rustup-toolchain:
+    description: >
+      Whether `RUSTUP_TOOLCHAIN` was exported for the rest of the job, as `true`
+      or `false`, after applying the default.
+    value: ${{ steps.rust-toolchain.outputs.set-rustup-toolchain }}
+
+  cargo-tools:
+    description: >
+      The cargo tools that were made available, as a JSON array string of
+      `name@version` entries (e.g. `["cargo-nextest@0.9.143"]`), in the order they
+      were requested. Every version is concrete: a `latest` entry appears as
+      whatever crates.io resolved it to. This is the same set the `bin` cache key
+      was derived from, so hashing it reproduces that key's final segment — which
+      also means a tool the registry could not answer for is published honestly as
+      `name@unknown` rather than being hidden or dropped.
+    value: ${{ steps.rust-toolchain.outputs.cargo-tools }}
+
+  json:
+    description: >
+      Every output above as one JSON object, natively typed — `targets` and
+      `components` are real arrays and `set-rustup-toolchain` is a real boolean,
+      so `fromJSON(steps.<id>.outputs.json).targets` drops straight into a matrix.
+      It also adds two provenance blocks the flat outputs cannot carry: `inputs`,
+      the toolchain inputs verbatim, and `toml`, the parsed `rust-toolchain.toml`
+      before merging. Together they say where every resolved value came from —
+      absent toml scalars are `null`, unset inputs are empty strings. `inputs`
+      covers only the inputs a `rust-toolchain.toml` can also supply, plus `set-
+      rustup-toolchain`; the `cache-*` inputs have no toml counterpart and are
+      reported through the `cache` output instead.
+    value: ${{ steps.rust-toolchain.outputs.json }}
+
+  # Aliases kept for callers written against this composite's older names.
+  # `cache-key` predates the upstream `cachekey`, and `rust-version` predates
+  # `name`; both still resolve, so nothing has to be updated in lockstep.
+  cache-key:
+    description: "Alias of `cachekey`."
+    value: ${{ steps.rust-toolchain.outputs.cachekey }}
+
+  rust-version:
+    description: "Alias of `name`, the resolved toolchain (e.g. `1.97.1`)."
+    value: ${{ steps.rust-toolchain.outputs.name }}
 runs:
   using: "composite"
   steps:

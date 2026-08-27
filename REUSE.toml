@@ -43,6 +43,7 @@ ignore = [
   "**/docs/index.md",
   "**/mutants*/",
   "**/package*.json",
+  "**/streaming-vs-tree.json",
   "**/supply-chain/.cargo-vet/**",
   "**/tsconfig*.json",
 ]

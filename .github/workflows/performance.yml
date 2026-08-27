@@ -1,49 +1,20 @@
-# SPDX-FileCopyrightText: 2026 Elio Severo Junior <elioseverojunior@gmail.com>
+# SPDX-FileCopyrightText: Glaucus contributors
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 name: Performance
 
-# Multi-architecture benchmark run: `perf-matrix` expands one platform table
-# into a job per NATIVE host, `perf-report` pivots the results into one table.
-#
-# It measures; it does not gate. Figures from GitHub-hosted runners are marked
-# `degraded` -- read ratios within a column, never absolute times across them.
-# Dispatch inputs reach a shell only through `env:`, never `${{ }}` inline.
+# Benchmarks one job per NATIVE host; `perf-report` pivots the results.
+# Figures from GitHub-hosted runners are marked `degraded`: read ratios down a
+# column, never absolute times across them.
 
 concurrency:
   group: perf-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 on:
-  # Auto-triggers disabled: the benchmark gate is flaky on shared CI runners
-  # (noisy neighbours skew timings and fail PRs on phantom regressions). Run it
-  # manually via the Actions tab / `gh workflow run performance.yml` when needed.
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - "crates/glaucus-core/**"
-  #     - "crates/glaucus-serde/**"
-  #     - "crates/glaucus/**"
-  #     - "crates/glaucus-bench/**"
-  #     - "Cargo.toml"
-  #     - "Cargo.lock"
-  #     - ".github/workflows/performance.yml"
-  # pull_request:
-  #   branches: [main]
-  #   paths:
-  #     - "crates/glaucus-core/**"
-  #     - "crates/glaucus-serde/**"
-  #     - "crates/glaucus/**"
-  #     - "crates/glaucus-bench/**"
-  #     - "Cargo.toml"
-  #     - "Cargo.lock"
-  #     - ".github/workflows/performance.yml"
-  # The matrix is chosen HERE, at dispatch time, not hardcoded in the job. A
-  # benchmark run is expensive -- the full suite is ~85 minutes per host, and
-  # macOS minutes bill at 10x Linux -- so "measure everything" has to be a
-  # deliberate choice rather than the only option. Every input has a default
-  # that makes a bare `gh workflow run performance.yml` do the full sweep.
+  # Dispatch only: benchmark timings on shared runners fail PRs on phantom
+  # regressions. Inputs reach a shell through `env:`, never `${{ }}` inline.
   workflow_dispatch:
     inputs:
       platforms:
@@ -53,19 +24,24 @@ on:
         options:
           - all
           - linux
-          - macos
-          - linux-x86_64
-          - linux-aarch64
-          - macos-x86_64
-          - macos-aarch64
-      toolchain:
-        description: "Toolchain: `default` reads rust-toolchain.toml"
+          - linux-24.04-x86_64
+          - linux-24.04-aarch64
+      channel:
+        description: "Rust channel to bench; `default` reads rust-toolchain.toml"
         type: choice
         default: default
         options:
           - default
           - stable
           - nightly
+      profile:
+        description: "Profile: `default` to setup with rust-toolchain.toml"
+        type: choice
+        default: default
+        options:
+          - default
+          - minimal
+          - complete
       mode:
         description: "`quick` trades Criterion's precision for wall-clock"
         type: choice
@@ -78,30 +54,17 @@ on:
         type: string
         default: ""
 
-# Read-only at workflow scope. Every write this workflow needs is declared on
-# the single job that performs it, below.
-#
-# The distinction is not cosmetic even with one job: a workflow-level grant is
-# inherited by every job added later, so the second job to appear here would
-# silently receive push access to gh-pages and comment access to pull requests
-# without anyone writing that down. Declaring it per job makes the next
-# contributor state the need explicitly, which is the point of least privilege.
+# Read-only at workflow scope; a job that needs to write declares it itself,
+# so a job added later cannot inherit a grant nobody wrote down.
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  # `mise run` installs [tools] before every task, which overrides mise-action's
-  # `install: false`: the Supply Chain job spent 8m57s having `mise run comply`
-  # build all 26 pinned tools from source, because mise looks for cargo-binstall
-  # at ~/.cargo/bin and CI has none, so its cargo backend compiles instead. The
-  # gates below use mise for its config flags, not for provisioning --
-  # setup-rust-env has already put every tool they need on PATH as a prebuilt
-  # binary.
+  # Stops `mise run` installing a task's missing tools mid-job.
   MISE_TASK_RUN_AUTO_INSTALL: false
-  # mise.toml's [env] does `GITHUB_TOKEN = {{env.GITHUB_TOKEN | default(value='')}}`,
-  # so with nothing set it exports an EMPTY token -- worse than unset, since any
-  # tool that reads it then makes unauthenticated, rate-limited API calls.
+  # mise.toml exports an EMPTY token when this is unset, which shadows every
+  # other credential source and makes API calls unauthenticated.
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || github.token }}
   GITVERSION_SPEC: ${{ vars.GITVERSION_SPEC || '6.x' }}
   CRITERION_HOME: ${{ github.workspace }}/target/criterion
@@ -114,6 +77,23 @@ jobs:
   setup:
     name: Setup
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    outputs:
+      cachekey: ${{ steps.setup-rust-env.outputs.cachekey }}
+      cachekey-full: ${{ steps.setup-rust-env.outputs.cachekey-full }}
+      cache: ${{ steps.setup-rust-env.outputs.cache }}
+      cache-hit: ${{ steps.setup-rust-env.outputs.cache-hit }}
+      name: ${{ steps.setup-rust-env.outputs.name }}
+      toolchain: ${{ steps.setup-rust-env.outputs.toolchain }}
+      targets: ${{ steps.setup-rust-env.outputs.targets }}
+      target: ${{ steps.setup-rust-env.outputs.target }}
+      components: ${{ steps.setup-rust-env.outputs.components }}
+      profile: ${{ steps.setup-rust-env.outputs.profile }}
+      msrv: ${{ steps.setup-rust-env.outputs.msrv }}
+      msrv-effective: ${{ steps.setup-rust-env.outputs.msrv-effective }}
+      msrv-source: ${{ steps.setup-rust-env.outputs.msrv-source }}
+      set-rustup-toolchain: ${{ steps.setup-rust-env.outputs.set-rustup-toolchain }}
+      cargo-tools: ${{ steps.setup-rust-env.outputs.cargo-tools }}
+      json: ${{ steps.setup-rust-env.outputs.json }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -128,6 +108,7 @@ jobs:
       # failure: those crates publish no prebuilt binary, so mise source-builds
       # them here once per mise.lock change and later jobs restore the cache.
       - name: Setup Environment
+        id: setup-rust-env
         uses: ./.github/actions/setup-rust-env
 
   # ──────────────────────────────────────────────
@@ -169,54 +150,45 @@ jobs:
   # a run stops being `degraded`.
   perf-matrix:
     name: Perf Matrix
-    # A ROOT job. It expands a table with jq -- no checkout, no toolchain, no
-    # dependency on `setup`, whose cache is keyed to ONE host and therefore has
-    # nothing to offer four different ones.
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    needs: [setup]
     timeout-minutes: 5
     outputs:
       include: ${{ steps.expand.outputs.include }}
       count: ${{ steps.expand.outputs.count }}
+      # Only the pinned toolchain produces publishable numbers. Any other
+      # selection is exploratory: bench it, report it, push nothing.
+      publish: ${{ inputs.channel == 'default' || inputs.channel == '' }}
     steps:
       - name: Expand the platform table
         id: expand
-        # Through the environment rather than `${{ }}` inside the script body:
-        # `platforms` is a dispatch input, and interpolating one straight into a
-        # shell is the injection shape the header note above forbids. `choice`
-        # inputs constrain the value, but the rule does not bend for the inputs
-        # that happen to be safe today.
+        # Through `env:`, never interpolated into the script body.
         env:
           SELECT: ${{ inputs.platforms || 'all' }}
-          CHANNEL: ${{ inputs.toolchain || 'default' }}
+          TOOLCHAIN: ${{ inputs.channel == 'default' && needs.setup.outputs.toolchain || inputs.channel }}
+          PROFILE: ${{ inputs.profile || 'default' }}
           RUNNER_LINUX_X86_64: ${{ vars.PERF_RUNNER_LINUX_X86_64 || 'ubuntu-24.04' }}
           RUNNER_LINUX_AARCH64: ${{ vars.PERF_RUNNER_LINUX_AARCH64 || 'ubuntu-24.04-arm' }}
-          RUNNER_MACOS_X86_64: ${{ vars.PERF_RUNNER_MACOS_X86_64 || 'macos-26-intel' }}
-          RUNNER_MACOS_AARCH64: ${{ vars.PERF_RUNNER_MACOS_AARCH64 || 'macos-26' }}
         run: |
           set -Eeuo pipefail
+
+          # Empty means "read rust-toolchain.toml"; the sentinel is not a channel
+          # rustup knows, so it must never reach the composite.
+          if [ "${TOOLCHAIN}" = "default" ]; then TOOLCHAIN=""; fi
 
           include="$(
             jq -nc \
               --arg select "${SELECT}" \
-              --arg channel "${CHANNEL}" \
+              --arg toolchain "${TOOLCHAIN}" \
+              --arg profile "${PROFILE}" \
               --arg linux_x86_64 "${RUNNER_LINUX_X86_64}" \
-              --arg linux_aarch64 "${RUNNER_LINUX_AARCH64}" \
-              --arg macos_x86_64 "${RUNNER_MACOS_X86_64}" \
-              --arg macos_aarch64 "${RUNNER_MACOS_AARCH64}" '
+              --arg linux_aarch64 "${RUNNER_LINUX_AARCH64}" '
                 [
                   {key: "linux-24.04-x86_64",  label: "ubuntu-24.04",  os: "linux", arch: "x86_64",  runner: $linux_x86_64,  target: "x86_64-unknown-linux-gnu"},
-                  {key: "linux-24.04-aarch64", label: "ubuntu-24.04-arm", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"},
-                  {key: "macos-26-x86_64",  label: "macos-26-intel",  os: "macos", arch: "x86_64",  runner: $macos_x86_64,  target: "x86_64-apple-darwin"},
-                  {key: "macos-26-aarch64", label: "macos-26", os: "macos", arch: "aarch64", runner: $macos_aarch64, target: "aarch64-apple-darwin"}
+                  {key: "linux-24.04-aarch64", label: "ubuntu-24.04-arm", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"}
                 ]
                 | map(select($select == "all" or .os == $select or .key == $select))
-                | map(. + {
-                    channel: $channel,
-                    # setup-rust-env reads rust-toolchain.toml when this is
-                    # empty, which is what keeps that file the single source of
-                    # truth for the default run.
-                    toolchain: (if $channel == "default" then "" else $channel end)
-                  })
+                | map(. + {toolchain: $toolchain, profile: $profile})
               '
           )"
 
@@ -232,9 +204,9 @@ jobs:
           {
             echo "### Performance matrix"
             echo
-            echo "| Platform | Runner | Target | Toolchain |"
-            echo "|:--|:--|:--|:--|"
-            jq -r '.[] | "| \(.label) | `\(.runner)` | `\(.target)` | \(.channel) |"' <<<"${include}"
+            echo "| Platform | Runner | Target | Toolchain | Profile |"
+            echo "|:--|:--|:--|:--|:--|"
+            jq -r '.[] | "| \(.label) | `\(.runner)` | `\(.target)` | \(.toolchain) | \(.profile) |"' <<<"${include}"
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ──────────────────────────────────────────────
@@ -242,11 +214,7 @@ jobs:
   # ──────────────────────────────────────────────
   lint:
     name: Lint
-    # `setup` and `version` are the two roots and run in parallel; everything
-    # downstream gates on both. Naming `version` in this first tier is what makes
-    # a version failure stop the run here rather than surfacing 20 minutes later
-    # in `build` -- and `tests` inherits the dependency transitively, so it does
-    # not need repeating there.
+    # Gating on `version` here stops a version failure surfacing 20 minutes later.
     needs: [setup, version]
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
     steps:
@@ -275,9 +243,6 @@ jobs:
   # routine toolchain bump an invisible breaking change for consumers (issue #3).
   msrv:
     name: MSRV
-    # First tier, alongside `lint`/`sast`, rather than downstream of them: this
-    # is one `cargo check`, and a broken floor should surface in three minutes
-    # instead of behind the full test-and-build chain.
     needs: [setup, version]
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
     permissions:
@@ -393,11 +358,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # No submodules and no history. The only submodule is the yaml-test-
-          # suite conformance corpus, which nothing under crates/glaucus-bench
-          # reads -- every fixture there is generated in code -- and cloning it
-          # on four runners buys nothing. bench-to-json.py's `git rev-parse`
-          # calls are satisfied by a depth-1 checkout.
+          # No submodules and no history: nothing the benches read comes from a
+          # submodule -- every fixture is generated in code -- and cloning one on
+          # four runners buys nothing. bench-to-json.py's `git rev-parse` calls
+          # are satisfied by a depth-1 checkout.
           fetch-depth: 1
           ref: ${{ env.REF }}
 
@@ -405,10 +369,11 @@ jobs:
         uses: ./.github/actions/setup-rust-env
         with:
           toolchain: ${{ matrix.toolchain }}
-          # Namespaced per platform AND per channel: these caches key on the
+          profile: ${{ matrix.profile }}
+          # Namespaced per platform AND per toolchain: these caches key on the
           # dependency set and the toolchain, and four hosts sharing one
           # namespace would otherwise trade artifacts they cannot use.
-          cache-key-suffix: perf-${{ matrix.key }}-${{ matrix.channel }}
+          cache-key-suffix: perf-${{ matrix.key }}-${{ matrix.toolchain }}
 
       # The guard that makes the matrix mean what it says. If a runner label
       # ever moves -- GitHub retires an image, someone repoints a PERF_RUNNER_*
@@ -472,14 +437,8 @@ jobs:
           sudo cpupower frequency-set --governor performance \
             || echo "cpupower unavailable; continuing with the default governor"
 
-      # Records how busy the host was BEFORE the run, which is the only moment
-      # the answer is meaningful. See the script's own header for 2026-08-01,
-      # where 77 internally consistent measurements were 4.6x-20.9x wrong.
-      #
-      # `--report`, so a busy runner marks the data rather than failing the job:
-      # on a shared runner the verdict is `degraded` often enough that a gate
-      # would just be noise, and the marker is what the docs page keys its
-      # warning banner off.
+      # Before the run, the only moment the answer means anything. `--report` marks
+      # the data rather than failing: on a shared runner a gate would be noise.
       - name: Host preflight
         id: preflight
         run: |
@@ -603,6 +562,8 @@ jobs:
           path: perf-out
 
       - name: Build the cross-platform summary
+        env:
+          PUBLISHABLE: ${{ needs.perf-matrix.outputs.publish }}
         run: |
           set -Eeuo pipefail
           shopt -s nullglob
@@ -643,6 +604,11 @@ jobs:
             echo
             echo "> Compare DOWN a column. Absolute times from different hosts are not"
             echo "> comparable, and every \`degraded\` row was measured on a shared VM."
+            if [ "${PUBLISHABLE}" != "true" ]; then
+              echo ">"
+              echo "> Exploratory run on a non-default toolchain: results are shown here"
+              echo "> and uploaded as artifacts, but nothing is published."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
           # One artifact carrying every platform, for anyone who wants to diff
@@ -667,7 +633,8 @@ jobs:
   # regression gate. Restoring it under a matrix needs three things: per-platform
   # `benchmark-data-dir-path` (one shared dir interleaves incomparable series),
   # serialised pushes (four jobs racing on gh-pages lose history), and
-  # `contents: write` on whichever job pushes -- absent today because every job
+  # a gate on `needs.perf-matrix.outputs.publish`, so only a default-toolchain
+  # run can write, and `contents: write` on whichever job pushes -- absent today because every job
   # here is read-only. docs/benchmarks/results.data.ts also reads ONE
   # benchmarks.json, so publishing four platforms means teaching it the platform
   # dimension first. Until then, read perf-combined.json.

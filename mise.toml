@@ -17,11 +17,11 @@ experimental = true
 idiomatic_version_file = true
 idiomatic_version_file_enable_tools = ["rust"]
 legacy_version_file = false
+locked = false
 lockfile = true
 not_found_auto_install = true
 python.uv_venv_auto = "create|source"
 quiet = true
-locked = false
 ### Debug
 #verbose = true
 #log_level = "debug"
@@ -61,23 +61,12 @@ _.file = ".env"
 "cargo:cargo-update" = { version = "latest" }
 "cargo:cargo-wizard" = { version = "latest" }
 "cargo:committed" = { version = "latest" }
+"cargo:comply" = { version = "latest" }
 "cargo:flamegraph" = { version = "latest" }
+"cargo:ignorefile-cli" = { version = "latest" }
 "cargo:rumdl" = { version = "latest" }
 "cargo:taplo-cli" = { version = "latest" }
 "cargo:yamllint-rs" = { version = "latest" }
-
-# comply is deliberately NOT here, for the same reason as ignorefile below.
-#
-# It is a git-source install, and cargo-binstall cannot serve one: comply is on
-# crates.io only as semver prereleases (0.0.1-1, 0.1.0-9), which `cargo install`
-# skips, and its GitHub releases publish no binary assets. Every `mise install`
-# therefore compiled it from source -- roughly 3.5 minutes, in EVERY job of every
-# run. Run 30706537351 spent 7m19s in `mise install --locked` and was cancelled
-# still compiling.
-#
-# `.github/actions/setup-rust-env` installs it once instead, pinned to a rev and
-# guarded by the ~/.cargo/bin cache, so it is built on a cache miss rather than
-# on every job. Local developers get it from `mise run comply:install`.
 
 # Python
 "pipx:codecov-cli" = { version = "latest" }
@@ -96,12 +85,6 @@ _.file = ".env"
 actionlint = { version = "latest" }
 git-cliff = { version = "latest" }
 gitleaks = { version = "latest" }
-# ignorefile is deliberately NOT here. Its three binaries live in one git
-# workspace and none is on crates.io yet, and mise's cargo backend cannot pass a
-# package selector to `cargo install --git` -- it emits a bare
-# `cargo install --git=<url>`, which cargo rejects with "multiple packages with
-# binaries found". Both `bin` and `crate` are ignored. `mise run
-# ignorefile:install` does it instead; move it here once the crates publish.
 scorecard = { version = "latest" }
 taplo = { version = "latest" }
 
@@ -1440,25 +1423,20 @@ usage = 'arg "[args]" var=#true help="comply subcommand + flags; defaults to `li
 
 [tasks."comply:fix"]
 alias = []
-description = "Add/refresh SPDX headers on source files with `comply annotate` (the WRITE counterpart to the lint-only `comply` task). Requires explicit paths — it never blanket-annotates, since most files are covered aggregately by REUSE.toml's `**` rule"
+description = "Add/refresh SPDX headers with `comply annotate` (the WRITE counterpart to the lint-only `comply` task). Takes files or directories; defaults to . (the whole project)"
 run = '''
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
 
-# `comply lint` only CHECKS; this is the writer. Paths are required on purpose:
-# REUSE.toml's `**` aggregate annotation already makes every file compliant, so
-# headers are an opt-in per-file convention (used on source files), not a blanket
-# operation. Pass `--copyright` WITHOUT a year — comply prepends the current year
-# itself, so embedding one would double it ("2026 2026 …"). --merge-copyrights
-# keeps re-runs idempotent (no duplicate copyright lines).
-# `<paths>` is declared required in the usage spec below, so mise rejects an
-# empty invocation with a proper CLI error before this script ever runs.
-eval "paths=(${usage_paths:-})"
-# Never annotate symlinks — the per-crate LICENSE-APACHE/LICENSE-MIT links point
-# at the shared LICENSES/ texts, so `comply annotate` would write THROUGH the link
-# (corrupting the canonical license) or drop a `.license` sidecar. Filter them out
-# (defence-in-depth; the *.rs scope already excludes the license links).
+# `comply lint` only CHECKS; this is the writer. Defaults to `.` -- the whole
+# project -- which `--recursive` below then walks. Licence and copyright are not
+# passed: REUSE.toml supplies both, and comply treats its own flags as optional
+# whenever it does, so there is one source of truth rather than two.
+eval "paths=(${usage_paths:-.})"
+# Never annotate symlinks -- the per-crate LICENSE-* links point at the shared
+# LICENSES/ texts, so `comply annotate` would write THROUGH the link or drop a
+# `.license` sidecar.
 real=()
 for p in "${paths[@]}"; do
     if [ -L "$p" ]; then
@@ -1467,47 +1445,44 @@ for p in "${paths[@]}"; do
         real+=("$p")
     fi
 done
-# Joined-string test, not `${#real[@]}`: mise renders run blocks as tera
-# templates and bash's array-length syntax opens a tera comment (`{#`), failing
-# the task with "Closing comment tag `#}` not found". Paths are never empty
-# strings, so the two tests agree here.
+# Joined-string test, not an array-length expansion: mise renders run blocks as
+# Tera templates first, and a brace followed by a hash opens a Tera comment --
+# which is why that sequence is never written literally in this file either.
 if [ -z "${real[*]:-}" ]; then
     exit 0
 fi
-# Built from this workspace for the same reason as [tasks.comply]: an installed
-# binary would write headers using a different version of the tool than the one
-# under change.
-# --update-reuse-toml false is now the CLI default too; it stays spelled out
-# here so this task's behaviour is pinned regardless of any future default
-# change. The `**` aggregate in REUSE.toml already covers these files, so a
-# per-file `override` block adds nothing -- and `override` would supersede the
-# inline header written above.
+# --update-reuse-toml false is the CLI default too, spelled out so this task's
+# behaviour is pinned against a future default change. REUSE.toml's `**` aggregate
+# already covers these files, and an `override` block would supersede the inline
+# header written above.
 comply annotate \
-    --copyright "COMPLY contributors" \
-    --license "MIT OR Apache-2.0" \
-    --merge-copyrights \
-    --update-reuse-toml false \
+    --recursive \
+    --force \
     "${real[@]}"
-# `annotate` writes header CONTENT but leaves the shape of a header that already
-# exists; only `format` canonicalises shape. Running both is what makes this task
-# agree with `comply:format:check` by construction -- annotate for files with no
-# header, format for the ones that have a non-canonical one.
+# `annotate` writes header CONTENT but leaves the SHAPE of an existing header;
+# only `format` canonicalises shape. Running both is what makes this task agree
+# with `comply:format:check` by construction. `--files` takes ONE value per
+# occurrence, so the flag is repeated rather than handed a list.
 #
-# An earlier awk pass here did the opposite: it deleted the bare comment marker
-# between the copyright and licence lines. Because hk runs this task as a
-# pre-commit FIX step on every staged *.rs, each commit silently reverted the
-# canonical form, and `comply:format:check` then failed in CI on files that had
-# just been "fixed".
-# `--files` takes ONE value per occurrence, so the flag is repeated rather than
-# handed a list; `--files a.rs b.rs` makes clap reject b.rs as a stray argument.
-fmt_args=()
-for p in "${real[@]}"; do
-    fmt_args+=(--files "$p")
-done
-comply format "${fmt_args[@]}"
+# A lone directory goes through `--path`, explicit files through a repeated
+# `--files`: the two flags are not interchangeable -- `--files` names source
+# files, `--path` names the project root, and `comply format --files .` asks it
+# to format a directory as if it were a file. The emptiness test avoids an
+# array-length expansion for the Tera reason noted above.
+first="${real[0]}"
+rest="${real[*]:1}"
+if [ -z "$rest" ] && [ -d "$first" ]; then
+    comply format --path "$first"
+else
+    fmt_args=()
+    for p in "${real[@]}"; do
+        fmt_args+=(--files "$p")
+    done
+    comply format "${fmt_args[@]}"
+fi
 '''
 shell = "bash -c"
-usage = 'arg "<paths>" var=#true help="files to annotate, e.g. crates/foo/src/lib.rs"'
+usage = 'arg "[paths]" var=#true help="files or directories to annotate; defaults to . (the whole project) when omitted"'
 
 [tasks."comply:fix:all"]
 alias = []

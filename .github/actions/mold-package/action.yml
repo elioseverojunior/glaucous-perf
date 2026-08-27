@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: 2026 Elio Severo Junior <elioseverojunior@gmail.com>
+# SPDX-FileCopyrightText: Glaucus contributors
 #
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
@@ -17,7 +17,7 @@ runs:
         key: mold-deb-${{ runner.os }}-${{ runner.arch }}
 
     - name: Install mold (required by .cargo/config.toml on Linux)
-      if: runner.os == 'Linux' && runner.arch == 'X64' && steps.cache.outputs.cache-hit != 'true'
+      if: runner.os == 'Linux' && runner.arch == 'X64'
       shell: bash
       run: |
         if command -v mold >/dev/null 2>&1; then
