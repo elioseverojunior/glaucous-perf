@@ -1,0 +1,213 @@
+# SPDX-FileCopyrightText: Glaucus contributors
+#
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: Matrix
+
+# Derives the benchmark platform table from the repository itself rather than
+# from a hand-written list. `elioseverojunior/rust-toolchain-matrix` parses
+# Cargo.toml, rust-toolchain.toml and .clippy.toml and emits the legs; this
+# workflow filters them to the two NATIVE Linux hosts and decorates each one
+# with the identity fields performance.yml's `benchmark` job consumes.
+#
+# Why filter rather than ask the action for two targets: its `targets` input is
+# documented as MERGED ahead of the ones in rust-toolchain.toml, so it can add
+# legs but never remove them. rust-toolchain.toml declares four targets --
+# including wasm32 and x86_64-apple-darwin -- and neither belongs in a
+# benchmark that must execute the binary it built.
+
+concurrency:
+  group: matrix-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+    inputs:
+      platforms:
+        description: "Hosts to measure on: all, linux, or one platform key"
+        type: string
+        required: false
+        default: all
+      channel:
+        description: "Rust channel to bench; `default` reads rust-toolchain.toml"
+        type: string
+        required: false
+        default: default
+      profile:
+        description: "Profile: `default` to setup with rust-toolchain.toml"
+        type: string
+        required: false
+        default: default
+    # A reusable workflow's JOB outputs are invisible to its caller unless they
+    # are republished here -- without this block every `needs.matrix.outputs.*`
+    # in a caller silently reads the empty string, and `fromJSON('')` fails the
+    # run at expression-evaluation time with no useful message. The `jobs.matrix`
+    # references below track the job id: renaming the job breaks all four.
+    outputs:
+      include:
+        description: "The matrix `include` list, one entry per native Linux host"
+        value: ${{ jobs.matrix.outputs.include }}
+      count:
+        description: "How many legs `include` holds; 0 is a hard failure upstream"
+        value: ${{ jobs.matrix.outputs.count }}
+      publish:
+        description: "Whether these numbers are publishable -- true only on the pinned toolchain"
+        value: ${{ jobs.matrix.outputs.publish }}
+      toolchain:
+        description: "The channel the action resolved, e.g. 1.97"
+        value: ${{ jobs.matrix.outputs.toolchain }}
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "Hosts to measure on"
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - linux-24.04-x86_64
+          - linux-24.04-aarch64
+      channel:
+        description: "Rust channel to bench; `default` reads rust-toolchain.toml"
+        type: choice
+        default: default
+        options:
+          - default
+          - stable
+          - nightly
+      profile:
+        description: "Profile: `default` to setup with rust-toolchain.toml"
+        type: choice
+        default: default
+        options:
+          - default
+          - minimal
+          - complete
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  MISE_TASK_RUN_AUTO_INSTALL: false
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN || github.token }}
+  REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.ref }}
+
+jobs:
+  matrix:
+    name: Matrix
+    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    outputs:
+      include: ${{ steps.expand.outputs.include }}
+      count: ${{ steps.expand.outputs.count }}
+      toolchain: ${{ steps.derive.outputs.channel }}
+      # Only the pinned toolchain produces publishable numbers. Any other
+      # selection is exploratory: bench it, report it, push nothing.
+      publish: ${{ inputs.channel == 'default' || inputs.channel == '' }}
+    steps:
+      # The action reads Cargo.toml and rust-toolchain.toml off the workspace,
+      # so the checkout is a hard requirement, not a convenience. Depth 1 and no
+      # submodules: nothing it parses lives in history or in a submodule.
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ env.REF }}
+
+      - name: Derive the toolchain and targets from the repository
+        id: derive
+        uses: elioseverojunior/rust-toolchain-matrix@v0
+        with:
+          # `X && '' || Y` is the GitHub Actions trap: an empty string is FALSY,
+          # so the true branch falls straight through to Y and the override is
+          # never empty. Inverted, the condition yields the channel when one was
+          # asked for and '' otherwise, which is what makes the action fall back
+          # to rust-toolchain.toml. `default` is this workflow's sentinel, not a
+          # channel rustup knows, so it must never reach the action.
+          toolchain: ${{ inputs.channel != 'default' && inputs.channel || '' }}
+          # A benchmark measures the toolchain the project ships on. An MSRV leg
+          # would silently bench 1.88 alongside 1.97 under the same platform key
+          # and land both in one cache namespace.
+          include-msrv: "false"
+          # One unit for the whole workspace. `per-crate` would multiply every
+          # platform by the crate count, and the benches are workspace-wide.
+          workspace-mode: root
+          # Keeps the runner labels defined in exactly one place. The action's
+          # own table would pick `ubuntu-latest` for x86_64, and a floating image
+          # label re-dates every historical comparison the moment GitHub moves
+          # it -- a benchmark needs the pinned `ubuntu-24.04`.
+          #
+          # An override makes the action report `can-run: false` for the leg: it
+          # cannot know an arbitrary label runs the target natively, so it
+          # refuses to claim so. That field is therefore dropped below rather
+          # than propagated; performance.yml proves the same property far more
+          # strongly at runtime by comparing `rustc -vV`'s host triple against
+          # `matrix.target` before it benches anything.
+          runner-map: |
+            {
+              "x86_64-unknown-linux-gnu": "${{ vars.PERF_RUNNER_LINUX_X86_64 || 'ubuntu-24.04' }}",
+              "aarch64-unknown-linux-gnu": "${{ vars.PERF_RUNNER_LINUX_AARCH64 || 'ubuntu-24.04-arm' }}"
+            }
+
+      - name: Filter to the native Linux hosts and shape the platform table
+        id: expand
+        # Through `env:`, never interpolated into the script body.
+        env:
+          MATRIX: ${{ steps.derive.outputs.matrix }}
+          SELECT: ${{ inputs.platforms || 'all' }}
+          PROFILE: ${{ inputs.profile || 'default' }}
+          CHANNEL: ${{ steps.derive.outputs.channel }}
+          MSRV: ${{ steps.derive.outputs.msrv }}
+        run: |
+          set -Eeuo pipefail
+
+          # The one table left by hand, and deliberately so: `key` and `label`
+          # are IDENTITY, not configuration. `key` namespaces the build cache,
+          # the uploaded artifacts and the bench-data directory, so deriving it
+          # from a runner label would silently re-namespace all three the moment
+          # PERF_RUNNER_* moved. `label` names the column in the perf report for
+          # the same reason -- it stays the nominal platform even when the run
+          # lands on self-hosted metal.
+          include="$(
+            jq -nc \
+              --argjson matrix "${MATRIX}" \
+              --arg select "${SELECT}" \
+              --arg profile "${PROFILE}" '
+                {
+                  "x86_64-unknown-linux-gnu":  {key: "linux-24.04-x86_64",  label: "ubuntu-24.04"},
+                  "aarch64-unknown-linux-gnu": {key: "linux-24.04-aarch64", label: "ubuntu-24.04-arm"}
+                } as $native
+                | $matrix.include
+                # Everything the action derived that is not one of the two
+                # native Linux hosts -- wasm32, darwin -- leaves here.
+                | map(select($native[.target] != null))
+                # `.os` on an action leg is the RUNNER LABEL; the perf contract
+                # wants `os` to be the platform family and `runner` to be the
+                # label. Both reads resolve against the input leg, so the
+                # rename is safe inside one construction.
+                | map(. + $native[.target] + {os: "linux", runner: .os, profile: $profile})
+                | map(del(.["can-run"]))
+                | map(select($select == "all" or .os == $select or .key == $select))
+              '
+          )"
+
+          count="$(jq 'length' <<<"${include}")"
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::no platform matches '${SELECT}'; nothing to measure"
+            exit 1
+          fi
+
+          echo "include=${include}" >> "$GITHUB_OUTPUT"
+          echo "count=${count}" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Performance matrix"
+            echo
+            echo "Derived from \`rust-toolchain.toml\` and \`Cargo.toml\` by"
+            echo "\`elioseverojunior/rust-toolchain-matrix\`; channel \`${CHANNEL}\`, MSRV \`${MSRV}\` (not benched)."
+            echo
+            echo "| Platform | Runner | Target | Toolchain | Profile |"
+            echo "|:--|:--|:--|:--|:--|"
+            jq -r '.[] | "| \(.label) | `\(.runner)` | `\(.target)` | \(.toolchain) | \(.profile) |"' <<<"${include}"
+          } >> "$GITHUB_STEP_SUMMARY"
