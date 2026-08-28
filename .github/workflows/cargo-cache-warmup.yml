@@ -4,24 +4,30 @@
 
 name: Cargo Cache Warmup
 
-# Pre-pays performance.yml's `benchmark` preflight so a dispatched perf run
-# starts measuring instead of compiling.
+# Pre-pays the download half of performance.yml's `benchmark` preflight. It
+# DOWNLOADS; it does not compile, and it never runs a benchmark.
 #
-# A cache warmer is only worth anything if the key it WRITES is byte-identical
-# to the key the consumer READS -- GitHub treats any divergence as a full miss,
-# never a partial restore. That key is built from `runner.os`, `runner.arch`,
-# `cache-key-suffix`, the Cargo.lock hash, and a hash of the RESOLVED feature
-# set, so this workflow mirrors the bench job on every one of them:
+# setup-rust-env layers its cache, and the layers are warmed independently:
 #
-#   * runner   -- from the shared matrix, so aarch64 warms on an ARM64 host and
-#                 lands under `...-ARM64-...` rather than `...-X64-...`
-#   * suffix   -- `perf-<key>-<toolchain>`, character-for-character
-#                 performance.yml's own `cache-key-suffix`
-#   * features -- the SAME cargo invocation, `cargo bench --locked
-#                 -p glaucus-bench --no-run`. Not `--all-features`: that
-#                 resolves a different dependency graph, hashes to a different
-#                 key, and drags in glaucus-fuzz -> libfuzzer-sys, whose build
-#                 script needs a C++ toolchain the ARM64 image does not ship.
+#   registry  ~/.cargo/registry, keyed `registry-<os>-<arch>-<suffix>-<lockHash>`.
+#             No toolchain and no build-env digest -- crate sources are just
+#             archives -- so `cargo fetch` alone warms it completely. 157-167 MB
+#             per architecture, and the single biggest item this buys.
+#   bin       cargo tools, keyed `bin-<os>-<arch>-<toolSetHash>`. Warmed by
+#             setup-rust-env running at all; no cargo command required.
+#   mise      keyed on runner.os/runner.arch + mise.lock, warmed the same way.
+#             159 MB, and the reason a cold ARM64 leg used to burn ~8 minutes
+#             in `mise install` before it measured anything.
+#   build     target/, keyed with the spec and build-env digests. Warming it
+#             would mean compiling the bench crate, which is deliberately NOT
+#             done here -- the bench job still pays that cost itself.
+#
+# What makes any of it reachable is key parity, and GitHub gives no partial
+# credit: one divergent segment is a total miss. The two segments this workflow
+# has to get right are the suffix -- `perf-<key>-<toolchain>`, taken from the
+# same shared matrix performance.yml uses -- and the runner architecture, so an
+# aarch64 leg lands on `...-ARM64-...` rather than `...-X64-...`. See the `env:`
+# block below for the third, subtler one.
 #
 # The matrix is NOT declared here. It comes from shared-matrix.yml, which is
 # also what performance.yml consumes -- one definition of the platform table is
@@ -47,9 +53,16 @@ on:
 permissions:
   contents: read
 
+# NOTHING here may match rust-toolchain's build-env digest, or this workflow
+# writes to a key the bench job never reads. That digest hashes every variable
+# prefixed CARGO_, CC, CFLAGS, CXX, CMAKE or RUST, minus an exclusion list.
+# `CARGO_TERM_COLOR` is excluded (presentation, not output). `RUST_BACKTRACE`
+# is NOT -- and setting it is exactly how the previous version of this file
+# ended up on `...-95fb48e7-...` while every consumer sat on `...-e3b0c442-...`
+# (sha256("") -- no build-affecting environment at all). Verify before adding
+# a variable here: `sha256("NAME=value")[:8]` must stay `e3b0c442`.
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 jobs:
   # ──────────────────────────────────────────────
@@ -69,9 +82,10 @@ jobs:
     name: Warm up Cargo cache (${{ matrix.label }})
     needs: [matrix]
     runs-on: ${{ matrix.runner }}
-    # A cold release build of the bench crate and its graph. Well clear of the
-    # observed cost, but bounded so a wedged runner cannot burn the schedule.
-    timeout-minutes: 45
+    # A toolchain install plus a dependency download -- no compilation. Well
+    # clear of the observed cost, but bounded so a wedged runner cannot burn
+    # the schedule.
+    timeout-minutes: 15
     strategy:
       # One dead platform must not stop the other from being warmed; a
       # half-warm cache is strictly better than none.
@@ -120,36 +134,16 @@ jobs:
             exit 1
           fi
 
-      # .cargo/config.toml pins `linker = "aarch64-linux-gnu-gcc"` for this
-      # triple -- written for CROSS-compiling from x86_64, where that name is
-      # the cross toolchain. On a native arm64 runner the same triple is the
-      # host, and cargo still demands that exact binary name. Debian's multiarch
-      # gcc usually provides it; when it does not, the native compiler IS the
-      # right one and only the name is missing, so a symlink is the whole fix.
-      - name: Provide the linker name .cargo/config.toml expects
-        if: matrix.key == 'linux-24.04-aarch64'
-        run: |
-          set -Eeuo pipefail
-          if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
-            echo "aarch64-linux-gnu-gcc already on PATH: $(command -v aarch64-linux-gnu-gcc)"
-            exit 0
-          fi
-          mkdir -p "$HOME/.local/bin"
-          ln -sf "$(command -v gcc)" "$HOME/.local/bin/aarch64-linux-gnu-gcc"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "linked aarch64-linux-gnu-gcc -> $(command -v gcc)"
-
-      # # Character-for-character performance.yml's own "Build benchmarks (warm
-      # # cache, fail fast on compile errors)" step. Copying it is the POINT: any
-      # # edit here -- a feature flag, a `--target`, another package -- resolves a
-      # # different graph, hashes to a different key, and silently detaches this
-      # # workflow from the job it serves.
-      # #
-      # # No `--target`: the matrix guarantees a native host, and passing the
-      # # triple would move every artifact into `target/<triple>/release/` where
-      # # the bench job's untargeted build never looks.
-      # - name: Build benchmarks
-      #   run: cargo bench --locked -p glaucus-bench --no-run
+      # Fills ~/.cargo/registry, and that is the whole job. The `registry` layer
+      # is keyed `registry-<os>-<arch>-<suffix>-<lockHash>` -- no toolchain, no
+      # build-env digest, no compiled anything -- because it holds downloaded
+      # source archives that any rustc can consume. Fetching is therefore the
+      # complete and sufficient way to warm it; nothing is built here.
+      #
+      # `--locked` so a drifted Cargo.lock fails loudly rather than resolving a
+      # different graph and writing the wrong lockHash segment.
+      - name: Fetch the dependency graph
+        run: cargo fetch --locked
 
       - name: Summary
         env:
@@ -172,7 +166,8 @@ jobs:
             echo "| Cache suffix | \`${SUFFIX}\` |"
             echo "| Leg | 1 of ${LEGS} |"
             echo
-            echo "Readable by \`performance.yml\`'s \`benchmark\` job on the same suffix."
+            echo "Warmed: \`registry\` (this suffix), plus \`bin\` and \`mise\` for this architecture."
+            echo "NOT warmed: \`build\` -- nothing is compiled here, so the bench job still builds."
             echo
             echo '```'
             du -sh ~/.cargo/registry 2>/dev/null || echo "registry: n/a"

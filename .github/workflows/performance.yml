@@ -137,77 +137,34 @@ jobs:
     uses: ./.github/workflows/version.yml
 
   # ──────────────────────────────────────────────
-  #  3.  Perf matrix — ONE platform table, expanded at dispatch time
+  #  3.  Perf matrix — ONE platform table, shared with the cache warmer
   # ──────────────────────────────────────────────
-  # `runs-on` is the ONLY thing that decides which architecture a job measures:
-  # crossing `os` with an `arch` dimension puts both halves on the same machine
-  # and labels one of them wrong. Cross-compiling cannot rescue it either -- a
-  # benchmark has to RUN. So arch is a property of the runner label, and this
-  # table is the mapping. Labels verified 2026-08-26; macos-*-intel is the last
-  # x86_64 macOS image, available until August 2027.
+  # The table itself now lives in shared-matrix.yml, which DERIVES it from
+  # rust-toolchain.toml instead of hard-coding it. cargo-cache-warmup.yml calls
+  # that same workflow, and that shared call IS the cache-reuse mechanism: the
+  # benchmark cache key is `perf-<matrix.key>-<matrix.toolchain>` scoped by
+  # `<runner.os>-<runner.arch>`, so a warmer and its consumer agree only if both
+  # read platform, runner and toolchain from ONE definition. Re-inlining the
+  # table here would let the two drift apart in silence -- GitHub treats a
+  # divergent key as a total MISS, never a partial restore.
   #
-  # PERF_RUNNER_* override any label: pointing them at self-hosted metal is how
-  # a run stops being `degraded`.
+  # `needs: [setup]` is gone with it: the matrix used to borrow that job's
+  # resolved toolchain, and shared-matrix.yml reads rust-toolchain.toml itself.
+  #
+  # `runs-on` remains the ONLY thing that decides which architecture a job
+  # measures: crossing `os` with an `arch` dimension puts both halves on the
+  # same machine and labels one of them wrong, and cross-compiling cannot rescue
+  # it -- a benchmark has to RUN. PERF_RUNNER_* override any label; pointing
+  # them at self-hosted metal is how a run stops being `degraded`.
   perf-matrix:
     name: Perf Matrix
-    runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
-    needs: [setup]
-    timeout-minutes: 5
-    outputs:
-      include: ${{ steps.expand.outputs.include }}
-      count: ${{ steps.expand.outputs.count }}
-      # Only the pinned toolchain produces publishable numbers. Any other
-      # selection is exploratory: bench it, report it, push nothing.
-      publish: ${{ inputs.channel == 'default' || inputs.channel == '' }}
-    steps:
-      - name: Expand the platform table
-        id: expand
-        # Through `env:`, never interpolated into the script body.
-        env:
-          SELECT: ${{ inputs.platforms || 'all' }}
-          TOOLCHAIN: ${{ inputs.channel == 'default' && needs.setup.outputs.toolchain || inputs.channel }}
-          PROFILE: ${{ inputs.profile || 'default' }}
-          RUNNER_LINUX_X86_64: ${{ vars.PERF_RUNNER_LINUX_X86_64 || 'ubuntu-24.04' }}
-          RUNNER_LINUX_AARCH64: ${{ vars.PERF_RUNNER_LINUX_AARCH64 || 'ubuntu-24.04-arm' }}
-        run: |
-          set -Eeuo pipefail
-
-          # Empty means "read rust-toolchain.toml"; the sentinel is not a channel
-          # rustup knows, so it must never reach the composite.
-          if [ "${TOOLCHAIN}" = "default" ]; then TOOLCHAIN=""; fi
-
-          include="$(
-            jq -nc \
-              --arg select "${SELECT}" \
-              --arg toolchain "${TOOLCHAIN}" \
-              --arg profile "${PROFILE}" \
-              --arg linux_x86_64 "${RUNNER_LINUX_X86_64}" \
-              --arg linux_aarch64 "${RUNNER_LINUX_AARCH64}" '
-                [
-                  {key: "linux-24.04-x86_64",  label: "ubuntu-24.04",  os: "linux", arch: "x86_64",  runner: $linux_x86_64,  target: "x86_64-unknown-linux-gnu"},
-                  {key: "linux-24.04-aarch64", label: "ubuntu-24.04-arm", os: "linux", arch: "aarch64", runner: $linux_aarch64, target: "aarch64-unknown-linux-gnu"}
-                ]
-                | map(select($select == "all" or .os == $select or .key == $select))
-                | map(. + {toolchain: $toolchain, profile: $profile})
-              '
-          )"
-
-          count="$(jq 'length' <<<"${include}")"
-          if [ "${count}" -eq 0 ]; then
-            echo "::error::no platform matches '${SELECT}'; nothing to measure"
-            exit 1
-          fi
-
-          echo "include=${include}" >> "$GITHUB_OUTPUT"
-          echo "count=${count}" >> "$GITHUB_OUTPUT"
-
-          {
-            echo "### Performance matrix"
-            echo
-            echo "| Platform | Runner | Target | Toolchain | Profile |"
-            echo "|:--|:--|:--|:--|:--|"
-            jq -r '.[] | "| \(.label) | `\(.runner)` | `\(.target)` | \(.toolchain) | \(.profile) |"' <<<"${include}"
-          } >> "$GITHUB_STEP_SUMMARY"
+    permissions:
+      contents: read
+    uses: ./.github/workflows/shared-matrix.yml
+    with:
+      platforms: ${{ inputs.platforms }}
+      channel: ${{ inputs.channel }}
+      profile: ${{ inputs.profile }}
 
   # ──────────────────────────────────────────────
   #  4.  Lint — HK project lints
@@ -340,7 +297,15 @@ jobs:
   # ──────────────────────────────────────────────
   benchmark:
     name: Bench (${{ matrix.label }})
-    needs: [setup, version, perf-matrix]
+    # NOT `setup`. That job warms the SUFFIX-LESS registry/build layers, and its
+    # own comment says so: "for `lint` and `msrv`". This job reads
+    # `perf-<key>-<toolchain>` -- a different namespace entirely -- so gating on
+    # it only ever bought latency on the critical path. The layers this job DOES
+    # share, `bin` and `mise` (keyed on runner.os/runner.arch alone), are warmed
+    # for BOTH architectures by cargo-cache-warmup.yml; `setup` runs on X64 and
+    # so never warmed the ARM64 leg at all -- which is exactly why that leg used
+    # to pay a multi-minute cold `mise install` despite the dependency.
+    needs: [version, perf-matrix]
     runs-on: ${{ matrix.runner }}
     # The full suite is ~85 minutes on a healthy host and the slowest platform
     # sets this, not the fastest.
@@ -400,7 +365,7 @@ jobs:
       # gcc usually provides it; when it does not, the native compiler IS the
       # right one and only the name is missing, so a symlink is the whole fix.
       - name: Provide the linker name .cargo/config.toml expects
-        if: matrix.key == 'linux-aarch64'
+        if: matrix.key == 'linux-24.04-aarch64'
         run: |
           set -Eeuo pipefail
           if command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
