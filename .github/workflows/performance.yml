@@ -173,6 +173,10 @@ jobs:
     name: Lint
     # Gating on `version` here stops a version failure surfacing 20 minutes later.
     needs: [setup, version]
+    if: >
+      success() &&
+      needs.setup.result == 'success' &&
+      needs.version.result == 'success'
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
     steps:
       - name: Checkout
@@ -201,6 +205,10 @@ jobs:
   msrv:
     name: MSRV
     needs: [setup, version]
+    if: >
+      success() &&
+      needs.setup.result == 'success' &&
+      needs.version.result == 'success'
     runs-on: ${{ vars.RUNS_ON_ARM64 || vars.RUNS_ON || 'ubuntu-latest' }}
     permissions:
       contents: read
@@ -305,7 +313,12 @@ jobs:
     # for BOTH architectures by cargo-cache-warmup.yml; `setup` runs on X64 and
     # so never warmed the ARM64 leg at all -- which is exactly why that leg used
     # to pay a multi-minute cold `mise install` despite the dependency.
-    needs: [version, perf-matrix]
+    needs: [setup, version, perf-matrix]
+    if: >
+      success() &&
+      needs.setup.result == 'success' &&
+      needs.version.result == 'success' &&
+      needs.perf-matrix.result == 'success'
     runs-on: ${{ matrix.runner }}
     # The full suite is ~85 minutes on a healthy host and the slowest platform
     # sets this, not the fastest.
